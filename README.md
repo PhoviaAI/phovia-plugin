@@ -11,7 +11,7 @@ In Claude Code:
 /plugin install phovia
 ```
 
-Set the Phovia Brain API URL during install if prompted. The default is `https://brain.phovia.ai/api`. For local brain development, set `PHOVIA_BRAIN_URL` before running Claude Code or pass `--brain` to login. The helper accepts either an API base ending in `/api` or a service origin.
+The Phovia Brain API URL defaults to the hosted service `https://api.phovia.ai/api` — leave it as-is for normal use. Only self-hosters need to change it: set `PHOVIA_BRAIN_URL`, pass `--brain` to login, or set the plugin option during install. The helper accepts either an API base ending in `/api` or a service origin.
 
 ## Login
 
