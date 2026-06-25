@@ -18,8 +18,10 @@ Set the Phovia Brain API URL during install if prompted. The default is `https:/
 Run the plugin command:
 
 ```text
-/phovia login
+/phovia:phovia login
 ```
+
+Some Claude Code builds may expose the root command as `/phovia login`; if so, that form is equivalent.
 
 The helper starts the Phovia device authorization flow:
 
@@ -30,7 +32,7 @@ The helper starts the Phovia device authorization flow:
 
 The token file is written with `0600` permissions on POSIX systems; its directory is `0700`.
 
-If your Claude Code version shows plugin commands with namespaces, invoke `/phovia:phovia login`. You can also run the CLI helper from a Bash tool while the plugin is enabled:
+You can also run the CLI helper from a Bash tool while the plugin is enabled:
 
 ```bash
 phovia login --brain https://brain.example.com
@@ -43,7 +45,7 @@ phovia logout
 - `SessionStart` calls `POST {brain}/insight/recall` with `Authorization: Bearer <access_token>` and injects returned profile/insight text into Claude context.
 - `Stop` calls `POST {brain}/insight/ingest` with the last assistant message and a bounded transcript tail.
 
-If a hook receives `401`, it calls `POST <brain-origin>/api/auth/token/refresh` with the refresh token, updates the token file, and retries once. If refresh fails or tokens are missing, hooks exit successfully and show a reconnect hint: run `/phovia login`.
+If a hook receives `401`, it calls `POST <brain-origin>/api/auth/token/refresh` with the refresh token, updates the token file, and retries once. If refresh fails or tokens are missing, hooks exit successfully and show a reconnect hint: run `/phovia:phovia login` (or `/phovia login` if available).
 
 ## Configuration
 
