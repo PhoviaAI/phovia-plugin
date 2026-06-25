@@ -1,0 +1,372 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const http = require('http');
+const https = require('https');
+const crypto = require('crypto');
+const { spawn } = require('child_process');
+
+const DEFAULT_BRAIN_URL = 'https://brain.phovia.ai/api';
+const CLIENT = 'claude-code';
+
+main().catch((err) => {
+  if (process.argv[2] === 'hook') process.exit(0);
+  console.error(`Phovia: ${err.message}`);
+  process.exit(1);
+});
+
+async function main() {
+  const [cmd, ...args] = process.argv.slice(2);
+  if (!cmd || cmd === '--help' || cmd === '-h') return help();
+  if (cmd === 'login') return login(args);
+  if (cmd === 'status') return status(args);
+  if (cmd === 'logout') return logout(args);
+  if (cmd === 'hook') return hook(args[0]);
+  throw new Error(`unknown command: ${cmd}`);
+}
+
+function help() {
+  console.log(`Phovia Claude Code helper\n\nUsage:\n  phovia login [--brain URL] [--no-browser]\n  phovia status\n  phovia logout\n\nEnvironment:\n  PHOVIA_BRAIN_URL   Override the brain URL\n  PHOVIA_TOKEN_FILE  Override the token file (default: ~/.phovia/auth.json)`);
+}
+
+function parseFlags(args) {
+  const out = { _: [] };
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--brain') out.brain = args[++i];
+    else if (arg === '--token-file') out.tokenFile = args[++i];
+    else if (arg === '--no-browser') out.noBrowser = true;
+    else if (arg === '--help' || arg === '-h') out.help = true;
+    else out._.push(arg);
+  }
+  if (out.tokenFile) process.env.PHOVIA_TOKEN_FILE = out.tokenFile;
+  return out;
+}
+
+async function login(args) {
+  const flags = parseFlags(args);
+  if (flags.help) return help();
+  const existing = readAuth();
+  const brainUrl = normalizeBrainUrl(flags.brain || envBrainUrl() || (existing && existing.brain_url) || DEFAULT_BRAIN_URL);
+  const deviceId = (existing && existing.device_id) || crypto.randomUUID();
+  const start = await jsonRequest('POST', authUrlFor(brainUrl, '/auth/device/start'), {
+    client: CLIENT,
+    device_name: `${os.hostname()} (${os.platform()})`,
+    device_id: deviceId
+  });
+  if (start.status < 200 || start.status >= 300) throw new Error(apiError(start, 'device start failed'));
+  const d = start.json || {};
+  if (!d.device_code || !d.user_code) throw new Error('device start response missing device_code or user_code');
+
+  console.log('Phovia device login');
+  console.log(`User code: ${d.user_code}`);
+  if (d.verification_uri_complete) console.log(`Authorize: ${d.verification_uri_complete}`);
+  else if (d.verification_uri) console.log(`Open: ${d.verification_uri}`);
+  if (!flags.noBrowser && (d.verification_uri_complete || d.verification_uri)) openBrowser(d.verification_uri_complete || d.verification_uri);
+  console.log('Waiting for browser authorization...');
+
+  let intervalMs = Math.max(1, Number(d.interval || 5)) * 1000;
+  const deadline = Date.now() + Math.max(60, Number(d.expires_in || 600)) * 1000;
+  while (Date.now() < deadline) {
+    await sleep(intervalMs);
+    const token = await jsonRequest('POST', authUrlFor(brainUrl, '/auth/device/token'), {
+      device_code: d.device_code,
+      client: CLIENT
+    });
+    if (token.status >= 200 && token.status < 300) {
+      const saved = saveTokens(brainUrl, deviceId, token.json || {});
+      console.log(`Logged in to Phovia. Token file: ${saved}`);
+      return;
+    }
+    const err = (token.json && token.json.error) || '';
+    if (err === 'authorization_pending') continue;
+    if (err === 'slow_down') { intervalMs += 5000; continue; }
+    throw new Error(apiError(token, 'device authorization failed'));
+  }
+  throw new Error('device authorization expired; run phovia login again');
+}
+
+function status(args) {
+  parseFlags(args);
+  const auth = readAuth();
+  if (!auth || !auth.access_token) {
+    console.log('Not logged in. Run /phovia login.');
+    return;
+  }
+  const expires = auth.expires_at ? new Date(auth.expires_at).toISOString() : 'unknown';
+  console.log(`Logged in to ${auth.brain_url || DEFAULT_BRAIN_URL}`);
+  console.log(`Access token expires: ${expires}`);
+  console.log(`Token file: ${authPath()}`);
+}
+
+function logout(args) {
+  parseFlags(args);
+  try { fs.rmSync(authPath(), { force: true }); } catch (_) {}
+  console.log('Logged out of Phovia on this device.');
+}
+
+async function hook(kind) {
+  const input = await readStdinJson();
+  if (kind === 'session-start') return sessionStart(input);
+  if (kind === 'stop') return stopHook(input);
+}
+
+async function sessionStart(input) {
+  const result = await authedPost('/insight/recall', {
+    client: CLIENT,
+    event: 'SessionStart',
+    session_id: input.session_id,
+    cwd: input.cwd,
+    source: input.source,
+    model: input.model
+  });
+  if (result.authNeeded) return showLoginMessage();
+  if (!result.ok) return;
+  const context = formatRecall(result.body);
+  if (context) hookJson({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: context } });
+}
+
+async function stopHook(input) {
+  const result = await authedPost('/insight/ingest', {
+    client: CLIENT,
+    event: 'Stop',
+    session_id: input.session_id,
+    cwd: input.cwd,
+    stopped_at: new Date().toISOString(),
+    last_assistant_message: input.last_assistant_message || '',
+    transcript_tail: readTranscriptTail(input.transcript_path)
+  });
+  if (result.authNeeded) return showLoginMessage();
+}
+
+async function authedPost(apiPath, body) {
+  const auth = readAuth();
+  if (!auth || !auth.access_token) return { authNeeded: true };
+  const brainUrl = normalizeBrainUrl(envBrainUrl() || auth.brain_url || DEFAULT_BRAIN_URL);
+  let current = auth;
+  if (isExpired(current)) current = await refresh(current, brainUrl) || current;
+  let res = await insightPost(brainUrl, apiPath, body, bearer(current.access_token));
+  if (res.status === 401) {
+    current = await refresh(current, brainUrl);
+    if (!current) return { authNeeded: true };
+    res = await insightPost(brainUrl, apiPath, body, bearer(current.access_token));
+  }
+  if (res.status === 401) return { authNeeded: true };
+  return { ok: res.status >= 200 && res.status < 300, body: res.json || res.text };
+}
+
+
+async function insightPost(brainUrl, apiPath, body, headers) {
+  const res = await jsonRequest('POST', urlFor(brainUrl, apiPath), body, headers);
+  if (res.status === 404 && !hasApiBase(brainUrl)) return jsonRequest('POST', authUrlFor(brainUrl, apiPath), body, headers);
+  return res;
+}
+
+function hasApiBase(base) {
+  const root = new URL(base).pathname.replace(/\/+$/, '');
+  return root.endsWith('/api');
+}
+
+async function refresh(auth, brainUrl) {
+  if (!auth || !auth.refresh_token) return null;
+  const res = await jsonRequest('POST', authUrlFor(brainUrl, '/auth/token/refresh'), {
+    refresh_token: auth.refresh_token,
+    client: CLIENT,
+    device_id: auth.device_id
+  });
+  if (res.status < 200 || res.status >= 300) return null;
+  const next = Object.assign({}, auth, tokenFields(res.json || {}), { brain_url: brainUrl, updated_at: new Date().toISOString() });
+  if (!next.access_token) return null;
+  writeAuth(next);
+  return next;
+}
+
+function saveTokens(brainUrl, deviceId, data) {
+  const auth = Object.assign(tokenFields(data), {
+    brain_url: brainUrl,
+    device_id: deviceId,
+    token_type: data.token_type || 'Bearer',
+    updated_at: new Date().toISOString()
+  });
+  if (!auth.access_token || !auth.refresh_token) throw new Error('token response missing access_token or refresh_token');
+  writeAuth(auth);
+  return authPath();
+}
+
+function tokenFields(data) {
+  const expiresIn = Number(data.expires_in || 3600);
+  const out = {
+    expires_at: new Date(Date.now() + expiresIn * 1000).toISOString(),
+    token_type: data.token_type || 'Bearer'
+  };
+  if (data.access_token || data.access) out.access_token = data.access_token || data.access;
+  if (data.refresh_token || data.refresh) out.refresh_token = data.refresh_token || data.refresh;
+  return out;
+}
+
+function readAuth() {
+  try {
+    fixAuthMode();
+    return JSON.parse(fs.readFileSync(authPath(), 'utf8'));
+  } catch (_) { return null; }
+}
+
+function writeAuth(data) {
+  const file = authPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(path.dirname(file), 0o700); } catch (_) {}
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+  try { fs.chmodSync(tmp, 0o600); } catch (_) {}
+  fs.renameSync(tmp, file);
+  fixAuthMode();
+}
+
+function fixAuthMode() {
+  if (process.platform === 'win32') return;
+  try { fs.chmodSync(authPath(), 0o600); } catch (_) {}
+}
+
+function authPath() {
+  return process.env.PHOVIA_TOKEN_FILE || path.join(os.homedir(), '.phovia', 'auth.json');
+}
+
+function isExpired(auth) {
+  return auth.expires_at && Date.parse(auth.expires_at) <= Date.now() + 60000;
+}
+
+function bearer(token) {
+  return { Authorization: `Bearer ${token}` };
+}
+
+function envBrainUrl() {
+  return process.env.PHOVIA_BRAIN_URL || process.env.CLAUDE_PLUGIN_OPTION_brain_url;
+}
+
+function normalizeBrainUrl(value) {
+  return String(value || DEFAULT_BRAIN_URL).replace(/\/+$/, '');
+}
+
+
+function authUrlFor(base, suffix) {
+  const u = new URL(base);
+  const root = u.pathname === '/' ? '' : u.pathname.replace(/\/+$/, '');
+  if (!root.endsWith('/api')) u.pathname = `${root}/api`;
+  return urlFor(u.toString(), suffix);
+}
+
+function urlFor(base, suffix) {
+  const u = new URL(base);
+  const root = u.pathname === '/' ? '' : u.pathname.replace(/\/+$/, '');
+  u.pathname = `${root}/${suffix.replace(/^\/+/, '')}`;
+  u.search = '';
+  return u.toString();
+}
+
+function jsonRequest(method, target, body, headers) {
+  return new Promise((resolve) => {
+    const u = new URL(target);
+    const payload = body === undefined ? '' : JSON.stringify(body);
+    const req = (u.protocol === 'http:' ? http : https).request({
+      method,
+      hostname: u.hostname,
+      port: u.port,
+      path: `${u.pathname}${u.search}`,
+      timeout: 15000,
+      headers: Object.assign({ Accept: 'application/json' }, payload ? {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload)
+      } : {}, headers || {})
+    }, (res) => {
+      let text = '';
+      res.setEncoding('utf8');
+      res.on('data', (c) => { text += c; });
+      res.on('end', () => {
+        let json = null;
+        try { json = text ? JSON.parse(text) : null; } catch (_) {}
+        resolve({ status: res.statusCode || 0, json, text });
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('request timeout')));
+    req.on('error', (err) => resolve({ status: 0, text: err.message, json: null }));
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+function apiError(res, fallback) {
+  const body = res.json || {};
+  return body.error_description || body.message || body.error || res.text || fallback;
+}
+
+function openBrowser(url) {
+  const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'cmd' : 'xdg-open';
+  const args = process.platform === 'win32' ? ['/c', 'start', '', url] : [url];
+  const child = spawn(cmd, args, { detached: true, stdio: 'ignore' });
+  child.on('error', () => {});
+  child.unref();
+}
+
+function readTranscriptTail(file) {
+  if (!file) return '';
+  try {
+    const p = file.startsWith('~/') ? path.join(os.homedir(), file.slice(2)) : file;
+    const stat = fs.statSync(p);
+    const max = 120000;
+    const fd = fs.openSync(p, 'r');
+    const start = Math.max(0, stat.size - max);
+    const buf = Buffer.alloc(stat.size - start);
+    fs.readSync(fd, buf, 0, buf.length, start);
+    fs.closeSync(fd);
+    const text = buf.toString('utf8');
+    return start ? text.slice(text.indexOf('\n') + 1) : text;
+  } catch (_) { return ''; }
+}
+
+function formatRecall(body) {
+  if (!body) return '';
+  let text = '';
+  if (typeof body === 'string') text = body;
+  else if (typeof body.context === 'string') text = body.context;
+  else if (typeof body.additionalContext === 'string') text = body.additionalContext;
+  else if (typeof body.summary === 'string') text = body.summary;
+  else if (Array.isArray(body.insights)) text = body.insights.map(formatItem).join('\n');
+  else text = JSON.stringify(body, null, 2);
+  text = text.trim();
+  if (!text) return '';
+  return (`Phovia recalled user profile and insights for this session:\n${text}`).slice(0, 9500);
+}
+
+function formatItem(x) {
+  if (typeof x === 'string') return `- ${x}`;
+  return `- ${x.title || x.summary || x.text || JSON.stringify(x)}`;
+}
+
+function showLoginMessage() {
+  hookJson({
+    suppressOutput: true,
+    systemMessage: 'Phovia is not authorized. Run `/phovia login` to reconnect memory sync.'
+  });
+}
+
+function hookJson(value) {
+  process.stdout.write(JSON.stringify(value));
+}
+
+function readStdinJson() {
+  return new Promise((resolve) => {
+    let s = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (c) => { s += c; });
+    process.stdin.on('end', () => {
+      try { resolve(s ? JSON.parse(s) : {}); } catch (_) { resolve({}); }
+    });
+  });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

@@ -1,0 +1,20 @@
+{
+  "name": "phovia",
+  "owner": {
+    "name": "PhoviaAI"
+  },
+  "description": "Phovia Claude Code plugins",
+  "plugins": [
+    {
+      "name": "phovia",
+      "source": "./",
+      "displayName": "Phovia",
+      "description": "Phovia memory hooks and /phovia login for Claude Code.",
+      "author": {
+        "name": "PhoviaAI"
+      },
+      "repository": "https://github.com/PhoviaAI/phovia-plugin",
+      "keywords": ["memory", "hooks", "device-auth"]
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "phovia",
+  "displayName": "Phovia",
+  "version": "0.1.0",
+  "description": "Phovia memory hooks for Claude Code: recall on session start, ingest on stop, and device login.",
+  "author": {
+    "name": "PhoviaAI"
+  },
+  "repository": "https://github.com/PhoviaAI/phovia-plugin",
+  "homepage": "https://github.com/PhoviaAI/phovia-plugin#readme",
+  "keywords": [
+    "phovia",
+    "memory",
+    "hooks",
+    "device-auth",
+    "claude-code"
+  ],
+  "hooks": "./hooks/hooks.json",
+  "commands": "./commands/phovia.md",
+  "userConfig": {
+    "brain_url": {
+      "type": "string",
+      "title": "Phovia Brain URL",
+      "description": "API base URL for the Phovia brain service that exposes device auth and insight endpoints.",
+      "default": "https://brain.phovia.ai/api",
+      "required": true
+    }
+  }
+}
