@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/bin/phovia", "hook", "session-start"],
+            "timeout": 10,
+            "statusMessage": "Recalling Phovia memory"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/bin/phovia", "hook", "stop"],
+            "timeout": 30,
+            "statusMessage": "Syncing Phovia memory"
+          }
+        ]
+      }
+    ]
+  }
+}
