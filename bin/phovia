@@ -84,6 +84,7 @@ async function login(args) {
     if (token.status >= 200 && token.status < 300) {
       const saved = saveTokens(brainUrl, deviceId, token.json || {});
       console.log(`Logged in to Phovia. Token file: ${saved}`);
+      await printLoginRecall();
       return;
     }
     throw new Error(apiError(token, 'device authorization failed'));
@@ -117,18 +118,40 @@ async function hook(kind) {
 }
 
 async function sessionStart(input) {
+  const result = await recallMemory(input);
+  if (result.authNeeded) return showLoginMessage();
+  if (!result.ok) return;
+  const context = result.context;
+  if (context) hookJson({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: context } });
+}
+
+async function printLoginRecall() {
+  const result = await recallMemory({});
+  if (result.authNeeded) {
+    console.log('Phovia memory recall is not authorized. Run /phovia login again to reconnect memory sync.');
+    return;
+  }
+  if (!result.ok) {
+    console.log(loginRecallError(result.body));
+    return;
+  }
+  if (result.context) {
+    console.log('');
+    console.log(result.context);
+  }
+}
+
+async function recallMemory(input) {
   const result = await authedPost('/insight/recall', {
     client: CLIENT,
     event: 'SessionStart',
-    session_id: input.session_id,
-    cwd: input.cwd,
-    source: input.source,
-    model: input.model
+    session_id: input && input.session_id,
+    cwd: input && input.cwd,
+    source: input && input.source,
+    model: input && input.model
   });
-  if (result.authNeeded) return showLoginMessage();
-  if (!result.ok) return;
-  const context = formatRecall(result.body);
-  if (context) hookJson({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: context } });
+  if (result.authNeeded || !result.ok) return result;
+  return Object.assign({}, result, { context: formatRecall(result.body) });
 }
 
 async function stopHook(input) {
@@ -318,6 +341,13 @@ function jsonRequest(method, target, body, headers) {
 function apiError(res, fallback) {
   const body = res.json || {};
   return body.error_description || body.message || body.error || res.text || fallback;
+}
+
+function loginRecallError(body) {
+  const message = typeof body === 'string'
+    ? body
+    : (body && (body.error_description || body.message || body.error));
+  return `Logged in, but Phovia memory recall could not complete${message ? `: ${message}` : '.'} Memory will be recalled on the next session start, or run /phovia login again if authorization may have expired.`;
 }
 
 function openBrowser(url) {
