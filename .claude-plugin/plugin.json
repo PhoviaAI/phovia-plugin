@@ -3,7 +3,7 @@
   "name": "phovia",
   "displayName": "Phovia",
   "version": "0.1.1",
-  "description": "Phovia memory hooks for Claude Code: recall on session start, ingest on stop, and device login.",
+  "description": "Phovia memory hooks and local MCP search for Claude Code, with device login.",
   "author": {
     "name": "PhoviaAI"
   },
@@ -12,6 +12,7 @@
   "keywords": [
     "phovia",
     "memory",
+    "mcp",
     "hooks",
     "device-auth",
     "claude-code"
@@ -25,6 +26,18 @@
       "description": "Optional. API base URL of the Phovia brain. Defaults to the hosted Phovia service; only change this if you self-host.",
       "default": "https://api.phovia.ai/api",
       "required": false
+    }
+  },
+  "mcpServers": {
+    "phovia-memory": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/mcp/server.mjs"
+      ],
+      "env": {
+        "NODE_PATH": "${CLAUDE_PLUGIN_DATA}/node_modules",
+        "PHOVIA_MCP_DEPS_DIR": "${CLAUDE_PLUGIN_DATA}"
+      }
     }
   }
 }
