@@ -146,7 +146,11 @@ function send(res, status, body) {
   fs.writeFileSync(transcript, '{"type":"user","message":"hello"}\n');
   const { server, url } = await startBrain();
   try {
-    await run(['login', '--brain', url, '--no-browser'], { env: { PHOVIA_TOKEN_FILE: tokenFile } });
+    const login = await run(['login', '--brain', url, '--no-browser'], { env: { PHOVIA_TOKEN_FILE: tokenFile } });
+    assert.match(login.stdout, /Logged in to Phovia/);
+    assert.match(login.stdout, /phovia_memory_untrusted/);
+    assert.match(login.stdout, /prefers terse summaries/);
+    assert.doesNotMatch(login.stdout, /access-1|refresh-1/);
     assert.strictEqual(fs.statSync(tokenFile).mode & 0o777, 0o600);
     let auth = JSON.parse(fs.readFileSync(tokenFile, 'utf8'));
     assert.strictEqual(auth.access_token, 'access-1');
