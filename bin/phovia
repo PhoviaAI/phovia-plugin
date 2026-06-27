@@ -12,11 +12,13 @@ const { spawn } = require('child_process');
 const DEFAULT_BRAIN_URL = 'https://api.phovia.ai/api';
 const CLIENT = 'claude-code';
 
-main().catch((err) => {
-  if (process.argv[2] === 'hook') process.exit(0);
-  console.error(`Phovia: ${err.message}`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    if (process.argv[2] === 'hook') process.exit(0);
+    console.error(`Phovia: ${err.message}`);
+    process.exit(1);
+  });
+}
 
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);
@@ -392,3 +394,15 @@ function readStdinJson() {
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+module.exports = {
+  DEFAULT_BRAIN_URL,
+  CLIENT,
+  authedPost,
+  readAuth,
+  authPath,
+  normalizeBrainUrl,
+  urlFor,
+  authUrlFor,
+  formatItem
+};

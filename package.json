@@ -1,0 +1,16 @@
+{
+  "name": "phovia-plugin",
+  "version": "0.1.1",
+  "private": true,
+  "description": "Phovia Claude Code plugin helpers and local MCP memory server.",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node tests/phovia.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0"
+  }
+}
