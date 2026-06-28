@@ -114,15 +114,25 @@ function logout(args) {
 async function hook(kind) {
   const input = await readStdinJson();
   if (kind === 'session-start') return sessionStart(input);
+  if (kind === 'user-prompt') return userPrompt(input);
   if (kind === 'stop') return stopHook(input);
 }
 
 async function sessionStart(input) {
-  const result = await recallMemory(input);
+  const result = await recallMemory(input, 'SessionStart');
   if (result.authNeeded) return showLoginMessage();
   if (!result.ok) return;
+  markSessionLoaded(input);
   const context = result.context;
   if (context) hookJson({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: context } });
+}
+
+async function userPrompt(input) {
+  if (!sessionLoadedPath(input) || hasSessionLoaded(input)) return;
+  const result = await recallMemory(input, 'UserPromptSubmit');
+  if (result.authNeeded || !result.ok) return;
+  markSessionLoaded(input);
+  if (result.context) hookJson({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: result.context } });
 }
 
 async function printLoginRecall() {
@@ -141,10 +151,10 @@ async function printLoginRecall() {
   }
 }
 
-async function recallMemory(input) {
+async function recallMemory(input, event) {
   const result = await authedPost('/insight/recall', {
     client: CLIENT,
-    event: 'SessionStart',
+    event: event || 'SessionStart',
     session_id: input && input.session_id,
     cwd: input && input.cwd,
     source: input && input.source,
@@ -273,6 +283,38 @@ function fixAuthMode() {
 
 function authPath() {
   return process.env.PHOVIA_TOKEN_FILE || path.join(os.homedir(), '.phovia', 'auth.json');
+}
+
+function sessionDir() {
+  return process.env.PHOVIA_SESSION_DIR || path.join(os.homedir(), '.phovia', 'sessions');
+}
+
+function sessionLoadedPath(input) {
+  if (!input || !input.session_id) return null;
+  return path.join(sessionDir(), `${encodeURIComponent(String(input.session_id))}.loaded`);
+}
+
+function hasSessionLoaded(input) {
+  const file = sessionLoadedPath(input);
+  if (!file) return false;
+  try { return fs.existsSync(file); } catch (_) { return false; }
+}
+
+function markSessionLoaded(input) {
+  const file = sessionLoadedPath(input);
+  if (!file) return false;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(path.dirname(file), 0o700); } catch (_) {}
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({
+      session_id: String(input.session_id),
+      loaded_at: new Date().toISOString()
+    }) + '\n', { mode: 0o600 });
+    try { fs.chmodSync(tmp, 0o600); } catch (_) {}
+    fs.renameSync(tmp, file);
+    return true;
+  } catch (_) { return false; }
 }
 
 function isExpired(auth) {
@@ -431,6 +473,9 @@ module.exports = {
   authedPost,
   readAuth,
   authPath,
+  sessionLoadedPath,
+  hasSessionLoaded,
+  markSessionLoaded,
   normalizeBrainUrl,
   urlFor,
   authUrlFor,

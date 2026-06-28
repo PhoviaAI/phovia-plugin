@@ -43,9 +43,10 @@ phovia logout
 ## Hooks
 
 - `SessionStart` calls `POST {brain}/insight/recall` with `Authorization: Bearer <access_token>` and injects returned profile/insight text into Claude context.
+- `UserPromptSubmit` performs a cheap per-session "already loaded" marker check before each user prompt. If `SessionStart` did not successfully load memory (for example because the network was down or login had not happened yet), it silently retries recall and injects memory once the token/network is available.
 - `Stop` calls `POST {brain}/insight/ingest` with the last assistant message and a bounded transcript tail.
 
-If a hook receives `401`, it calls `POST <brain-origin>/api/auth/token/refresh` with the refresh token, updates the token file, and retries once. If refresh fails or tokens are missing, hooks exit successfully and show a reconnect hint: run `/phovia:phovia login` (or `/phovia login` if available).
+If a hook receives `401`, it calls `POST <brain-origin>/api/auth/token/refresh` with the refresh token, updates the token file, and retries once. If refresh fails or tokens are missing, hooks exit successfully; `SessionStart`/`Stop` may show a reconnect hint to run `/phovia:phovia login` (or `/phovia login` if available), while `UserPromptSubmit` stays silent and retries on the next prompt.
 
 ## On-demand memory search
 
