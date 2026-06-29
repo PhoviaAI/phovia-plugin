@@ -6,15 +6,112 @@ const http = require('http');
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
+const { z } = require('zod');
 
 const bin = path.join(__dirname, '..', 'bin', 'phovia');
 const mcpServer = path.join(__dirname, '..', 'mcp', 'server.mjs');
 const requests = [];
+const contractViolations = [];
 const failRecallSessions = new Set();
 let tokenPolls = 0;
 let manifestVersion = '9.9.9';
 
 const phovia = require(path.join(__dirname, '..', 'bin', 'phovia'));
+
+function makeVendoredBrainInsightSchemas(z) {
+  // Vendored from Phovia brain src/application/contracts/insight.ts
+  // (insightRecallRequestSchema / insightIngestRequestSchema). Keep this
+  // copy in sync with the backend contract so the plugin mock rejects drifted
+  // request bodies instead of returning a blanket { ok: true }.
+  const INSIGHT_INGEST_MESSAGE_CONTENT_MAX_LENGTH = 8000;
+  const insightRecallRequestSchema = z.object({
+    topic: z.string().trim().min(1).optional()
+  });
+  const insightIngestMessageSchema = z.object({
+    id: z.string().trim().min(1).max(200).optional(),
+    role: z.string().trim().min(1).max(50),
+    content: z
+      .string()
+      .max(INSIGHT_INGEST_MESSAGE_CONTENT_MAX_LENGTH)
+      .refine(value => value.trim().length > 0, {
+        message: 'message content is required'
+      }),
+    name: z.string().trim().min(1).max(100).optional(),
+    created_at: z.string().trim().min(1).max(100).optional()
+  });
+  const insightIngestRequestSchema = z.object({
+    messages: z.array(insightIngestMessageSchema).min(1).max(500),
+    device_id: z.string().trim().min(1).max(200),
+    agent_type: z.string().trim().min(1).max(50),
+    agent_id: z.string().trim().min(1).max(200),
+    session_id: z.string().trim().min(1).max(200),
+    mode: z.string().trim().min(1).max(50),
+    generated_by_model: z.string().trim().min(1).max(100).optional()
+  });
+  return {
+    '/api/insight/recall': insightRecallRequestSchema,
+    '/api/insight/ingest': insightIngestRequestSchema
+  };
+}
+
+function schemaErrorMessage(result) {
+  return result.error.issues
+    .map(issue => {
+      const where = issue.path.length ? issue.path.join('.') : '<root>';
+      return `${where}: ${issue.message}`;
+    })
+    .join('; ');
+}
+
+function validateInsightContract(schemas, reqPath, body) {
+  const schema = schemas[reqPath];
+  if (!schema) return null;
+  const result = schema.safeParse(body);
+  if (result.success) return null;
+  return `${reqPath} body does not match brain schema: ${schemaErrorMessage(result)}`;
+}
+
+function rejectOnInsightContractMismatch(schemas, reqPath, body, res) {
+  const message = validateInsightContract(schemas, reqPath, body);
+  if (!message) return false;
+  contractViolations.push({ path: reqPath, body, message });
+  send(res, 400, { error: 'invalid_insight_contract', message });
+  return true;
+}
+
+function assertInsightContractAccepts(schemas, reqPath, body) {
+  const message = validateInsightContract(schemas, reqPath, body);
+  assert.strictEqual(message, null, message);
+}
+
+function assertInsightContractRejects(schemas, reqPath, body) {
+  const message = validateInsightContract(schemas, reqPath, body);
+  assert(message, `${reqPath} schema unexpectedly accepted ${JSON.stringify(body)}`);
+}
+
+function assertCapturedInsightRequestsMatchBrainSchemas(schemas) {
+  const insightRequests = requests.filter(r => r.path === '/api/insight/recall' || r.path === '/api/insight/ingest');
+  assert(insightRequests.some(r => r.path === '/api/insight/recall'), 'expected at least one captured insight recall request');
+  assert(insightRequests.some(r => r.path === '/api/insight/ingest'), 'expected at least one captured insight ingest request');
+  for (const request of insightRequests) {
+    assertInsightContractAccepts(schemas, request.path, request.body);
+  }
+  assertNoInsightContractViolations();
+}
+
+function assertNoInsightContractViolations() {
+  assert.strictEqual(
+    contractViolations.length,
+    0,
+    contractViolations.map(v => `${v.message}; body=${JSON.stringify(v.body)}`).join('\n')
+  );
+}
+
+function assertInsightSchemaGuardrails(schemas) {
+  assertInsightContractAccepts(schemas, '/api/insight/recall', { event: 'SessionStart', session_id: 's1' });
+  assertInsightContractRejects(schemas, '/api/insight/recall', { topic: '' });
+  assertInsightContractRejects(schemas, '/api/insight/ingest', { transcript_tail: 'legacy shape', client: 'claude-code' });
+}
 
 function run(args, opts = {}) {
   return new Promise((resolve, reject) => {
@@ -96,7 +193,7 @@ async function withMcp(env, fn) {
   }
 }
 
-async function startBrain() {
+async function startBrain(schemas) {
   const server = http.createServer((req, res) => {
     let raw = '';
     req.on('data', c => { raw += c; });
@@ -112,6 +209,7 @@ async function startBrain() {
       } else if (req.url === '/api/auth/token/refresh') {
         out = { access_token: 'access-2', expires_in: 3600, token_type: 'Bearer' };
       } else if (req.url === '/api/insight/recall') {
+        if (rejectOnInsightContractMismatch(schemas, req.url, body, res)) return;
         if (req.headers.authorization === 'Bearer old-access') return send(res, 401, { error: 'expired' });
         assert(['Bearer access-1', 'Bearer access-2'].includes(req.headers.authorization));
         if (failRecallSessions.delete(body.session_id)) return send(res, 503, { error: 'offline' });
@@ -128,6 +226,7 @@ async function startBrain() {
       } else if (req.url === '/manifest.json') {
         return send(res, 200, { version: manifestVersion });
       } else if (req.url === '/api/insight/ingest') {
+        if (rejectOnInsightContractMismatch(schemas, req.url, body, res)) return;
         assert.strictEqual(req.headers.authorization, 'Bearer access-1');
         out = { ok: true };
       } else {
@@ -147,6 +246,8 @@ function send(res, status, body) {
 }
 
 (async () => {
+  const brainSchemas = makeVendoredBrainInsightSchemas(z);
+  assertInsightSchemaGuardrails(brainSchemas);
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-test-'));
   const tokenFile = path.join(tmp, 'auth.json');
   const sessionDir = path.join(tmp, 'sessions');
@@ -159,7 +260,7 @@ function send(res, status, body) {
   };
   const marker = sessionId => path.join(sessionDir, `${encodeURIComponent(sessionId)}.loaded`);
   fs.writeFileSync(transcript, '{"type":"user","message":{"role":"user","content":"hello"}}\n{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi there"}]}}\n');
-  const { server, url } = await startBrain();
+  const { server, url } = await startBrain(brainSchemas);
   try {
     const login = await run(['login', '--brain', url, '--no-browser'], { env: hookEnv });
     assert.match(login.stdout, /Logged in to Phovia/);
@@ -292,6 +393,7 @@ function send(res, status, body) {
       env: hookEnv,
       input: JSON.stringify({ hook_event_name: 'Stop', session_id: 's1', cwd: tmp, transcript_path: transcript, last_assistant_message: 'done' })
     });
+    assertNoInsightContractViolations();
     const ingest = requests.find(r => r.path === '/api/insight/ingest');
     assert.deepStrictEqual(ingest.body.messages, [
       { role: 'user', content: 'hello' },
@@ -318,6 +420,7 @@ function send(res, status, body) {
       env: hookEnv,
       input: JSON.stringify({ hook_event_name: 'Stop', session_id: 's1', cwd: tmp, transcript_path: driftTranscript, last_assistant_message: 'new answer' })
     });
+    assertNoInsightContractViolations();
     const driftIngest = requests.filter(r => r.path === '/api/insight/ingest')[ingestCountBefore];
     assert.deepStrictEqual(driftIngest.body.messages, [
       { role: 'user', content: 'new question' },
@@ -372,6 +475,7 @@ function send(res, status, body) {
     });
     evil.close();
     assert(!requests.some(r => r.path === 'evil' && r.auth));
+    assertCapturedInsightRequestsMatchBrainSchemas(brainSchemas);
   } finally {
     server.close();
     fs.rmSync(tmp, { recursive: true, force: true });
