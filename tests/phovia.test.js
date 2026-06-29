@@ -233,6 +233,26 @@ function send(res, status, body) {
     assert.ok(ingest.body.device_id, 'ingest must include device_id');
     assert.strictEqual(ingest.body.transcript_tail, undefined);
 
+    // Regression: transcript tail ends with a NEW user message (the current
+    // reply lives only in last_assistant_message). The reply must pair with the
+    // newest user, not the user before the previous assistant.
+    const driftTranscript = path.join(tmp, 'transcript-drift.jsonl');
+    fs.writeFileSync(driftTranscript, [
+      '{"type":"user","message":{"role":"user","content":"old question"}}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"old answer"}]}}',
+      '{"type":"user","message":{"role":"user","content":"new question"}}'
+    ].join('\n') + '\n');
+    const ingestCountBefore = requests.filter(r => r.path === '/api/insight/ingest').length;
+    await run(['hook', 'stop'], {
+      env: hookEnv,
+      input: JSON.stringify({ hook_event_name: 'Stop', session_id: 's1', cwd: tmp, transcript_path: driftTranscript, last_assistant_message: 'new answer' })
+    });
+    const driftIngest = requests.filter(r => r.path === '/api/insight/ingest')[ingestCountBefore];
+    assert.deepStrictEqual(driftIngest.body.messages, [
+      { role: 'user', content: 'new question' },
+      { role: 'assistant', content: 'new answer' }
+    ]);
+
     auth.access_token = 'old-access';
     fs.writeFileSync(tokenFile, JSON.stringify(auth), { mode: 0o600 });
     await run(['hook', 'session-start'], {

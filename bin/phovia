@@ -436,12 +436,14 @@ function transcriptMessageText(message) {
   return '';
 }
 
-// The backend ingest unit is a single conversation turn. Parse the transcript
-// tail (Claude Code JSONL) and return the last user/assistant exchange.
-function readLastTurn(file) {
-  const out = { user: '', assistant: '' };
+function clampContent(value) {
+  const trimmed = (value || '').trim();
+  return trimmed.length > MESSAGE_CONTENT_MAX ? trimmed.slice(0, MESSAGE_CONTENT_MAX) : trimmed;
+}
+
+function transcriptSequence(file) {
   const text = readTranscriptTailText(file);
-  if (!text) return out;
+  if (!text) return [];
   const seq = [];
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
@@ -452,29 +454,45 @@ function readLastTurn(file) {
     if (!messageText) continue;
     seq.push({ role: obj.type, text: messageText });
   }
-  for (let i = seq.length - 1; i >= 0; i--) {
-    if (seq[i].role !== 'assistant') continue;
-    out.assistant = seq[i].text;
-    for (let j = i - 1; j >= 0; j--) {
-      if (seq[j].role === 'user') { out.user = seq[j].text; break; }
-    }
-    break;
-  }
-  return out;
+  return seq;
 }
 
-function clampContent(value) {
-  const trimmed = (value || '').trim();
-  return trimmed.length > MESSAGE_CONTENT_MAX ? trimmed.slice(0, MESSAGE_CONTENT_MAX) : trimmed;
+// The backend ingest unit is a single conversation turn. Pair the current
+// assistant reply with the user prompt that produced it.
+//   - When the hook supplies last_assistant_message (the just-finished reply,
+//     which may not be in the transcript yet), pair it with the MOST RECENT
+//     user message — never with the user before some older assistant.
+//   - Otherwise fall back to the last assistant in the transcript and the user
+//     immediately preceding it.
+function lastTurn(file, lastAssistantMessage) {
+  const seq = transcriptSequence(file);
+  const provided = clampContent(lastAssistantMessage);
+
+  if (provided) {
+    let user = '';
+    for (let i = seq.length - 1; i >= 0; i--) {
+      if (seq[i].role === 'user') { user = seq[i].text; break; }
+    }
+    return { user: clampContent(user), assistant: provided };
+  }
+
+  for (let i = seq.length - 1; i >= 0; i--) {
+    if (seq[i].role !== 'assistant') continue;
+    let user = '';
+    for (let j = i - 1; j >= 0; j--) {
+      if (seq[j].role === 'user') { user = seq[j].text; break; }
+    }
+    return { user: clampContent(user), assistant: clampContent(seq[i].text) };
+  }
+
+  return { user: '', assistant: '' };
 }
 
 function buildIngestMessages(input) {
-  const turn = readLastTurn(input.transcript_path);
+  const turn = lastTurn(input.transcript_path, input.last_assistant_message);
   const messages = [];
-  const user = clampContent(turn.user);
-  if (user) messages.push({ role: 'user', content: user });
-  const assistant = clampContent(input.last_assistant_message || turn.assistant);
-  if (assistant) messages.push({ role: 'assistant', content: assistant });
+  if (turn.user) messages.push({ role: 'user', content: turn.user });
+  if (turn.assistant) messages.push({ role: 'assistant', content: turn.assistant });
   return messages;
 }
 
