@@ -42,7 +42,7 @@ phovia logout
 
 ## Hooks
 
-- `SessionStart` calls `POST {brain}/insight/recall` with `Authorization: Bearer <access_token>` and injects returned profile/insight text into Claude context.
+- `SessionStart` calls `POST {brain}/insight/recall` with `Authorization: Bearer <access_token>` and injects returned profile/insight text into Claude context. It also runs a throttled, fail-safe stale-version check (see [Staying up to date](#staying-up-to-date)).
 - `UserPromptSubmit` performs a cheap per-session "already loaded" marker check before each user prompt. If `SessionStart` did not successfully load memory (for example because the network was down or login had not happened yet), it silently retries recall and injects memory once the token/network is available.
 - `Stop` calls `POST {brain}/insight/ingest` with the last assistant message and a bounded transcript tail.
 
@@ -63,11 +63,66 @@ The MCP server uses the same local `~/.phovia/auth.json` device tokens as the ho
 
 Claude Code installs the MCP SDK dependencies into the plugin data directory on first session start and reuses them across plugin updates. The MCP server requires the `node` executable used by Claude Code to be Node.js 18 or newer.
 
+## Staying up to date
+
+A cached, out-of-date plugin can keep running a broken code path long after a fix
+ships. Two layers shrink that window:
+
+**Auto-update (recommended).** Let Claude Code pull new plugin versions for you by
+enabling auto-update on the Phovia marketplace. Either toggle it in the UI
+(`/plugin` → **Marketplaces** → **phovia** → enable auto-update) or set it in
+`~/.claude/settings.json`:
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "phovia": {
+      "source": { "source": "github", "repo": "PhoviaAI/phovia-plugin" },
+      "autoUpdate": true
+    }
+  }
+}
+```
+
+With this on, Claude Code refreshes the marketplace and updates installed plugins
+at startup, so a returning user lands on the latest version without running
+`claude plugin update`.
+
+**Stale-version detection (self-heal).** The `SessionStart` hook also compares the
+installed plugin version against the latest published manifest. If the installed
+version is behind, it surfaces a loud, actionable `systemMessage` with the exact
+update commands. This check is throttled (at most once per `PHOVIA_VERSION_CHECK_TTL_MS`,
+default 6h) via a small `~/.phovia/version-check.json` cache and **always fails
+safe** — any network or parse error is swallowed and never blocks the session or
+suppresses memory recall.
+
+> Auto-update only *shrinks* the stale window — it does not close the deploy
+> ordering race where the backend ships a breaking change before clients update.
+> It must be paired with contract tests that prevent shipping drift and with
+> backward-compatible server contract evolution (accept old + new during a
+> migration window).
+
+To update manually:
+
+```text
+/plugin marketplace update phovia    # then restart Claude Code
+```
+
+```bash
+claude plugin update phovia
+```
+
 ## Configuration
 
 Environment variables:
 
 - `PHOVIA_BRAIN_URL` — override the configured brain URL.
 - `PHOVIA_TOKEN_FILE` — override the token file path for development/tests.
+- `PHOVIA_DISABLE_VERSION_CHECK` — set to `1` to disable stale-version detection.
+- `PHOVIA_VERSION_MANIFEST_URL` — override the published-version manifest URL
+  (defaults to the plugin manifest on the marketplace repo's default branch).
+- `PHOVIA_VERSION_CHECK_TTL_MS` — minimum interval between version checks
+  (default `21600000`, i.e. 6h).
+- `PHOVIA_VERSION_CACHE_FILE` — override the version-check cache path.
 
 The device-auth brain contract is from WO-066. On-demand search depends on brain WO-069 B1 (`/memory/search`) being available.
