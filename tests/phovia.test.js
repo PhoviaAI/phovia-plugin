@@ -5,9 +5,8 @@ const fs = require('fs');
 const http = require('http');
 const os = require('os');
 const path = require('path');
-const { createRequire } = require('module');
 const { spawn } = require('child_process');
-const { pathToFileURL } = require('url');
+const { z } = require('zod');
 
 const bin = path.join(__dirname, '..', 'bin', 'phovia');
 const mcpServer = path.join(__dirname, '..', 'mcp', 'server.mjs');
@@ -15,14 +14,6 @@ const requests = [];
 const contractViolations = [];
 const failRecallSessions = new Set();
 let tokenPolls = 0;
-
-async function loadVendoredBrainInsightSchemas() {
-  const depsModuleUrl = pathToFileURL(path.join(__dirname, '..', 'mcp', 'deps.mjs')).href;
-  const { ensureDependencies } = await import(depsModuleUrl);
-  const depsDir = ensureDependencies(path.join(__dirname, '..'));
-  const depsRequire = createRequire(path.join(depsDir, 'phovia-contract-test.cjs'));
-  return makeVendoredBrainInsightSchemas(depsRequire('zod').z);
-}
 
 function makeVendoredBrainInsightSchemas(z) {
   // Vendored from Phovia brain src/application/contracts/insight.ts
@@ -250,7 +241,7 @@ function send(res, status, body) {
 }
 
 (async () => {
-  const brainSchemas = await loadVendoredBrainInsightSchemas();
+  const brainSchemas = makeVendoredBrainInsightSchemas(z);
   assertInsightSchemaGuardrails(brainSchemas);
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-test-'));
   const tokenFile = path.join(tmp, 'auth.json');
