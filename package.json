@@ -1,6 +1,6 @@
 {
   "name": "phovia-plugin",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "description": "Phovia Claude Code plugin helpers and local MCP memory server.",
   "type": "commonjs",
