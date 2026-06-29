@@ -6,10 +6,15 @@ const http = require('http');
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
+const { insightIngestRequestSchema, insightRecallRequestSchema, validate } = require('./brain-schema');
 
 const bin = path.join(__dirname, '..', 'bin', 'phovia');
 const mcpServer = path.join(__dirname, '..', 'mcp', 'server.mjs');
 const requests = [];
+// Contract guardrail: every outgoing ingest/recall body the brain mock receives
+// is validated against brain's vendored request schemas. Mismatches are recorded
+// here so the test can assert the plugin never drifts from the real contract.
+const schemaErrors = [];
 const failRecallSessions = new Set();
 let tokenPolls = 0;
 
@@ -100,6 +105,19 @@ async function startBrain() {
     req.on('end', () => {
       const body = raw ? JSON.parse(raw) : {};
       requests.push({ path: req.url, auth: req.headers.authorization, body });
+      // Reject contract drift the way the real brain does: validate the outgoing
+      // payload against brain's schema and answer 400 on mismatch instead of the
+      // old "always {ok:true}" mock that hid the broken contract (#11).
+      const schema = req.url === '/api/insight/ingest' ? insightIngestRequestSchema
+        : req.url === '/api/insight/recall' ? insightRecallRequestSchema
+        : null;
+      if (schema) {
+        const errors = validate(schema, body);
+        if (errors.length) {
+          schemaErrors.push(`${req.url}: ${errors.join('; ')}`);
+          return send(res, 400, { error: 'schema_validation_failed', detail: errors });
+        }
+      }
       let out;
       if (req.url === '/api/auth/device/start') {
         out = { device_code: 'dev-code', user_code: 'USER-CODE', verification_uri: 'http://example.test/device', expires_in: 60, interval: 1 };
@@ -222,6 +240,11 @@ function send(res, status, body) {
       input: JSON.stringify({ hook_event_name: 'Stop', session_id: 's1', cwd: tmp, transcript_path: transcript, last_assistant_message: 'done' })
     });
     const ingest = requests.find(r => r.path === '/api/insight/ingest');
+    // Guardrail: the ingest body must satisfy brain's insightIngestRequestSchema.
+    // Reverting #11 (legacy `transcript_tail` shape) drops `messages`/`device_id`
+    // and adds unknown keys, so this fails first.
+    assert.deepStrictEqual(validate(insightIngestRequestSchema, ingest.body), [],
+      `ingest body violates brain insightIngestRequestSchema: ${JSON.stringify(ingest.body)}`);
     assert.deepStrictEqual(ingest.body.messages, [
       { role: 'user', content: 'hello' },
       { role: 'assistant', content: 'done' }
@@ -301,6 +324,24 @@ function send(res, status, body) {
     });
     evil.close();
     assert(!requests.some(r => r.path === 'evil' && r.auth));
+
+    // Final contract sweep: no ingest/recall body sent during the whole run may
+    // have violated brain's schema, and we must actually have exercised both
+    // endpoints (so the guardrail can't pass vacuously).
+    assert.deepStrictEqual(schemaErrors, [],
+      `outgoing payloads drifted from brain schema:\n${schemaErrors.join('\n')}`);
+    const ingestBodies = requests.filter(r => r.path === '/api/insight/ingest');
+    const recallBodies = requests.filter(r => r.path === '/api/insight/recall');
+    assert(ingestBodies.length >= 1, 'expected at least one ingest request');
+    assert(recallBodies.length >= 1, 'expected at least one recall request');
+    for (const r of ingestBodies) {
+      assert.deepStrictEqual(validate(insightIngestRequestSchema, r.body), [],
+        `ingest body violates brain insightIngestRequestSchema: ${JSON.stringify(r.body)}`);
+    }
+    for (const r of recallBodies) {
+      assert.deepStrictEqual(validate(insightRecallRequestSchema, r.body), [],
+        `recall body violates brain insightRecallRequestSchema: ${JSON.stringify(r.body)}`);
+    }
   } finally {
     server.close();
     fs.rmSync(tmp, { recursive: true, force: true });
