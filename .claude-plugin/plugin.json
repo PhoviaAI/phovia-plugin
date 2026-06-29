@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "phovia",
   "displayName": "Phovia",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Phovia memory hooks and local MCP search for Claude Code, with device login.",
   "author": {
     "name": "PhoviaAI"
