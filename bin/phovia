@@ -14,6 +14,9 @@ const CLIENT = 'claude-code';
 const AGENT_ID = 'phovia-plugin';
 const DEFAULT_MODE = 'engineering';
 const MESSAGE_CONTENT_MAX = 8000;
+const DEFAULT_REPO = 'PhoviaAI/phovia-plugin';
+const DEFAULT_VERSION_TTL_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_VERSION_TIMEOUT_MS = 2000;
 
 if (require.main === module) {
   main().catch((err) => {
@@ -122,12 +125,24 @@ async function hook(kind) {
 }
 
 async function sessionStart(input) {
+  // Stale-version self-heal: surface a loud, actionable notice if the installed
+  // plugin is behind the latest published version. Always fail safe — a version
+  // check must never block the session for long or suppress memory recall.
+  const staleNoticePromise = checkStaleVersion();
   const result = await recallMemory(input, 'SessionStart');
-  if (result.authNeeded) return showLoginMessage();
-  if (!result.ok) return;
+  const staleNotice = await staleNoticePromise;
+  if (result.authNeeded) return showLoginMessage(staleNotice);
+  if (!result.ok) {
+    if (staleNotice) hookJson({ suppressOutput: true, systemMessage: staleNotice });
+    return;
+  }
   markSessionLoaded(input);
   const context = result.context;
-  if (context) hookJson({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: context } });
+  if (!context && !staleNotice) return;
+  const out = { hookSpecificOutput: { hookEventName: 'SessionStart' } };
+  if (context) out.hookSpecificOutput.additionalContext = context;
+  if (staleNotice) out.systemMessage = staleNotice;
+  hookJson(out);
 }
 
 async function userPrompt(input) {
@@ -354,34 +369,52 @@ function urlFor(base, suffix) {
   return u.toString();
 }
 
-function jsonRequest(method, target, body, headers) {
+function jsonRequest(method, target, body, headers, options = {}) {
   return new Promise((resolve) => {
-    const u = new URL(target);
-    const payload = body === undefined ? '' : JSON.stringify(body);
-    const req = (u.protocol === 'http:' ? http : https).request({
-      method,
-      hostname: u.hostname,
-      port: u.port,
-      path: `${u.pathname}${u.search}`,
-      timeout: 15000,
-      headers: Object.assign({ Accept: 'application/json' }, payload ? {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload)
-      } : {}, headers || {})
-    }, (res) => {
-      let text = '';
-      res.setEncoding('utf8');
-      res.on('data', (c) => { text += c; });
-      res.on('end', () => {
-        let json = null;
-        try { json = text ? JSON.parse(text) : null; } catch (_) {}
-        resolve({ status: res.statusCode || 0, json, text });
+    let settled = false;
+    let req;
+    const timeoutMs = nonNegativeMs(options.timeoutMs, 15000);
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => {
+      if (req) req.destroy(new Error('request timeout'));
+      else done({ status: 0, text: 'request timeout', json: null });
+    }, timeoutMs);
+    if (timer.unref) timer.unref();
+    try {
+      const u = new URL(target);
+      const payload = body === undefined ? '' : JSON.stringify(body);
+      req = (u.protocol === 'http:' ? http : https).request({
+        method,
+        hostname: u.hostname,
+        port: u.port,
+        path: `${u.pathname}${u.search}`,
+        timeout: timeoutMs,
+        headers: Object.assign({ Accept: 'application/json' }, payload ? {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(payload)
+        } : {}, headers || {})
+      }, (res) => {
+        let text = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => { text += c; });
+        res.on('end', () => {
+          let json = null;
+          try { json = text ? JSON.parse(text) : null; } catch (_) {}
+          done({ status: res.statusCode || 0, json, text });
+        });
       });
-    });
-    req.on('timeout', () => req.destroy(new Error('request timeout')));
-    req.on('error', (err) => resolve({ status: 0, text: err.message, json: null }));
-    if (payload) req.write(payload);
-    req.end();
+      req.on('timeout', () => req.destroy(new Error('request timeout')));
+      req.on('error', (err) => done({ status: 0, text: err.message, json: null }));
+      if (payload) req.write(payload);
+      req.end();
+    } catch (err) {
+      done({ status: 0, text: err.message, json: null });
+    }
   });
 }
 
@@ -521,10 +554,148 @@ function formatItem(x) {
   return `- ${x.title || x.summary || x.text || JSON.stringify(x)}`;
 }
 
-function showLoginMessage() {
+// --- Stale-version detection -------------------------------------------------
+// Compares the installed plugin version against the latest published version
+// (the plugin manifest on the marketplace's default branch). Throttled via a
+// small cache so we hit the network at most once per TTL. Every path is wrapped
+// to return null on any error so a session is never blocked.
+async function checkStaleVersion() {
+  try {
+    if (truthyEnv(process.env.PHOVIA_DISABLE_VERSION_CHECK)) return null;
+    const installed = installedVersion();
+    if (!installed) return null;
+    const latest = await latestVersion();
+    if (!latest) return null;
+    if (compareSemver(latest, installed) <= 0) return null;
+    return staleNotice(installed, latest);
+  } catch (_) { return null; }
+}
+
+function staleNotice(installed, latest) {
+  return [
+    `Phovia plugin is out of date: installed ${installed}, latest ${latest}.`,
+    'A stale plugin can silently break memory sync. Update now:',
+    '  • `claude plugin update phovia` from a terminal, then restart Claude Code.',
+    'Recommended: enable auto-update so this stays current automatically — add',
+    '`"autoUpdate": true` to the phovia entry under `extraKnownMarketplaces` in',
+    '~/.claude/settings.json (or /plugin → Marketplaces → phovia → enable auto-update).'
+  ].join('\n');
+}
+
+async function latestVersion() {
+  const cache = readJsonFile(versionCachePath());
+  const ttl = versionCheckTtlMs();
+  if (cache && cache.latest && cache.checked_at && (Date.now() - Date.parse(cache.checked_at)) < ttl) {
+    return cache.latest;
+  }
+  const fetched = await fetchLatestVersion();
+  if (fetched) {
+    writeJsonFile(versionCachePath(), { latest: fetched, checked_at: new Date().toISOString() });
+    return fetched;
+  }
+  // Network failed: fall back to the last known value (without refreshing the
+  // timestamp, so the next session retries the fetch).
+  return cache && cache.latest ? cache.latest : null;
+}
+
+async function fetchLatestVersion() {
+  const url = manifestUrl();
+  if (!url) return null;
+  const res = await jsonRequest('GET', url, undefined, undefined, { timeoutMs: versionCheckTimeoutMs() });
+  if (res.status < 200 || res.status >= 300) return null;
+  const v = res.json && res.json.version;
+  return v ? String(v) : null;
+}
+
+function manifestUrl() {
+  if (process.env.PHOVIA_VERSION_MANIFEST_URL) return process.env.PHOVIA_VERSION_MANIFEST_URL;
+  return `https://raw.githubusercontent.com/${pluginRepo()}/main/.claude-plugin/plugin.json`;
+}
+
+function pluginRepo() {
+  const manifest = readPluginManifest();
+  const repo = manifest && manifest.repository;
+  if (!repo) return DEFAULT_REPO;
+  const value = typeof repo === 'object' && repo.url ? repo.url : repo;
+  const text = String(value).trim();
+  if (/^[^/\s]+\/[^/\s]+$/.test(text)) return text.replace(/\.git$/i, '');
+  const m = text.match(/github\.com[/:]([^/\s]+\/[^/\s?#]+)(?:[?#].*)?$/i);
+  return m ? m[1].replace(/\.git$/i, '') : DEFAULT_REPO;
+}
+
+function installedVersion() {
+  const manifest = readPluginManifest();
+  if (manifest && manifest.version) return String(manifest.version);
+  const pkg = readJsonFile(path.join(pluginRoot(), 'package.json'));
+  return pkg && pkg.version ? String(pkg.version) : null;
+}
+
+function readPluginManifest() {
+  return readJsonFile(path.join(pluginRoot(), '.claude-plugin', 'plugin.json'));
+}
+
+function pluginRoot() {
+  return process.env.CLAUDE_PLUGIN_ROOT || path.join(__dirname, '..');
+}
+
+function versionCachePath() {
+  return process.env.PHOVIA_VERSION_CACHE_FILE || path.join(os.homedir(), '.phovia', 'version-check.json');
+}
+
+function versionCheckTtlMs() {
+  return nonNegativeMs(process.env.PHOVIA_VERSION_CHECK_TTL_MS, DEFAULT_VERSION_TTL_MS);
+}
+
+function versionCheckTimeoutMs() {
+  return nonNegativeMs(process.env.PHOVIA_VERSION_CHECK_TIMEOUT_MS, DEFAULT_VERSION_TIMEOUT_MS);
+}
+
+function nonNegativeMs(value, fallback) {
+  if (value === undefined || value === '') return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+// Compares dotted numeric versions (x.y.z); prerelease/build suffixes are
+// ignored. Returns 1 if a > b, -1 if a < b, 0 if equal.
+function compareSemver(a, b) {
+  const pa = parseSemver(a);
+  const pb = parseSemver(b);
+  for (let i = 0; i < 3; i += 1) {
+    if (pa[i] > pb[i]) return 1;
+    if (pa[i] < pb[i]) return -1;
+  }
+  return 0;
+}
+
+function parseSemver(value) {
+  const core = String(value || '').trim().replace(/^v/i, '').split(/[-+]/)[0];
+  const parts = core.split('.').map(n => parseInt(n, 10));
+  return [parts[0] || 0, parts[1] || 0, parts[2] || 0];
+}
+
+function readJsonFile(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (_) { return null; }
+}
+
+function writeJsonFile(file, data) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
+    fs.renameSync(tmp, file);
+  } catch (_) {}
+}
+
+function truthyEnv(value) {
+  return value === '1' || /^(true|yes|on)$/i.test(String(value || ''));
+}
+
+function showLoginMessage(extraNotice) {
+  const base = 'Phovia is not authorized. Run `/phovia:phovia login` (or `/phovia login` if available) to reconnect memory sync.';
   hookJson({
     suppressOutput: true,
-    systemMessage: 'Phovia is not authorized. Run `/phovia:phovia login` (or `/phovia login` if available) to reconnect memory sync.'
+    systemMessage: extraNotice ? `${base}\n\n${extraNotice}` : base
   });
 }
 
@@ -559,5 +730,8 @@ module.exports = {
   normalizeBrainUrl,
   urlFor,
   authUrlFor,
-  formatItem
+  formatItem,
+  checkStaleVersion,
+  compareSemver,
+  installedVersion
 };

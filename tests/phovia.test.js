@@ -14,6 +14,9 @@ const requests = [];
 const contractViolations = [];
 const failRecallSessions = new Set();
 let tokenPolls = 0;
+let manifestVersion = '9.9.9';
+
+const phovia = require(path.join(__dirname, '..', 'bin', 'phovia'));
 
 function makeVendoredBrainInsightSchemas(z) {
   // Vendored from Phovia brain src/application/contracts/insight.ts
@@ -220,6 +223,8 @@ async function startBrain(schemas) {
           { fact: 'Project Apollo is waiting for API review.', project: 'Apollo', score: 0.91 },
           { text: 'Next step is validating the B1 memory search endpoint.', updated_at: '2026-06-01T12:00:00Z' }
         ] };
+      } else if (req.url === '/manifest.json') {
+        return send(res, 200, { version: manifestVersion });
       } else if (req.url === '/api/insight/ingest') {
         if (rejectOnInsightContractMismatch(schemas, req.url, body, res)) return;
         assert.strictEqual(req.headers.authorization, 'Bearer access-1');
@@ -247,7 +252,12 @@ function send(res, status, body) {
   const tokenFile = path.join(tmp, 'auth.json');
   const sessionDir = path.join(tmp, 'sessions');
   const transcript = path.join(tmp, 'transcript.jsonl');
-  const hookEnv = { PHOVIA_TOKEN_FILE: tokenFile, PHOVIA_SESSION_DIR: sessionDir };
+  const hookEnv = {
+    CLAUDE_PLUGIN_ROOT: path.join(__dirname, '..'),
+    PHOVIA_TOKEN_FILE: tokenFile,
+    PHOVIA_SESSION_DIR: sessionDir,
+    PHOVIA_DISABLE_VERSION_CHECK: '1'
+  };
   const marker = sessionId => path.join(sessionDir, `${encodeURIComponent(sessionId)}.loaded`);
   fs.writeFileSync(transcript, '{"type":"user","message":{"role":"user","content":"hello"}}\n{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi there"}]}}\n');
   const { server, url } = await startBrain(brainSchemas);
@@ -301,7 +311,12 @@ function send(res, status, body) {
 
     const lateTokenFile = path.join(tmp, 'late-auth.json');
     const lateSessionDir = path.join(tmp, 'late-sessions');
-    const lateEnv = { PHOVIA_TOKEN_FILE: lateTokenFile, PHOVIA_SESSION_DIR: lateSessionDir };
+    const lateEnv = {
+      CLAUDE_PLUGIN_ROOT: path.join(__dirname, '..'),
+      PHOVIA_TOKEN_FILE: lateTokenFile,
+      PHOVIA_SESSION_DIR: lateSessionDir,
+      PHOVIA_DISABLE_VERSION_CHECK: '1'
+    };
     const lateMarker = path.join(lateSessionDir, `${encodeURIComponent('late-login')}.loaded`);
     await run(['hook', 'session-start'], {
       env: lateEnv,
@@ -317,6 +332,62 @@ function send(res, status, body) {
     assert.strictEqual(latePromptJson.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
     assert.match(latePromptJson.hookSpecificOutput.additionalContext, /prefers terse summaries/);
     assert(fs.existsSync(lateMarker));
+
+    // Stale-version self-heal: a behind-by-version plugin surfaces a loud,
+    // actionable systemMessage without blocking memory recall.
+    const manifestUrl = url.replace(/\/api$/, '/manifest.json');
+    const baseUrl = url.replace(/\/api$/, '');
+    const versionEnv = {
+      CLAUDE_PLUGIN_ROOT: path.join(__dirname, '..'),
+      PHOVIA_TOKEN_FILE: tokenFile,
+      PHOVIA_SESSION_DIR: sessionDir,
+      PHOVIA_DISABLE_VERSION_CHECK: '',
+      PHOVIA_VERSION_MANIFEST_URL: manifestUrl,
+      PHOVIA_VERSION_CHECK_TTL_MS: '0',
+      PHOVIA_VERSION_CHECK_TIMEOUT_MS: '1000'
+    };
+
+    manifestVersion = '99.0.0';
+    const verStale = await run(['hook', 'session-start'], {
+      env: { ...versionEnv, PHOVIA_VERSION_CACHE_FILE: path.join(tmp, 'vcheck-stale.json') },
+      input: JSON.stringify({ hook_event_name: 'SessionStart', session_id: 'ver-stale', cwd: tmp })
+    });
+    const verStaleJson = JSON.parse(verStale.stdout);
+    assert.match(verStaleJson.systemMessage, /out of date/);
+    assert.match(verStaleJson.systemMessage, /99\.0\.0/);
+    assert.match(verStaleJson.systemMessage, /plugin update|marketplace update/);
+    assert.match(verStaleJson.hookSpecificOutput.additionalContext, /prefers terse summaries/);
+
+    // Up-to-date (latest <= installed): no notice, recall still flows.
+    manifestVersion = '0.0.1';
+    const verOk = await run(['hook', 'session-start'], {
+      env: { ...versionEnv, PHOVIA_VERSION_CACHE_FILE: path.join(tmp, 'vcheck-ok.json') },
+      input: JSON.stringify({ hook_event_name: 'SessionStart', session_id: 'ver-ok', cwd: tmp })
+    });
+    const verOkJson = JSON.parse(verOk.stdout);
+    assert.strictEqual(verOkJson.systemMessage, undefined);
+    assert.match(verOkJson.hookSpecificOutput.additionalContext, /prefers terse summaries/);
+
+    // Fail safe: an unreachable/missing manifest yields no notice and never
+    // blocks recall.
+    const verFail = await run(['hook', 'session-start'], {
+      env: {
+        ...versionEnv,
+        PHOVIA_VERSION_MANIFEST_URL: `${baseUrl}/missing.json`,
+        PHOVIA_VERSION_CACHE_FILE: path.join(tmp, 'vcheck-fail.json')
+      },
+      input: JSON.stringify({ hook_event_name: 'SessionStart', session_id: 'ver-fail', cwd: tmp })
+    });
+    const verFailJson = JSON.parse(verFail.stdout);
+    assert.strictEqual(verFailJson.systemMessage, undefined);
+    assert.match(verFailJson.hookSpecificOutput.additionalContext, /prefers terse summaries/);
+
+    // compareSemver unit coverage.
+    assert.strictEqual(phovia.compareSemver('0.1.4', '0.1.3'), 1);
+    assert.strictEqual(phovia.compareSemver('0.1.3', '0.1.4'), -1);
+    assert.strictEqual(phovia.compareSemver('1.0.0', '1.0.0'), 0);
+    assert.strictEqual(phovia.compareSemver('v0.2.0', '0.10.0'), -1);
+    assert.strictEqual(phovia.compareSemver('0.1.10', '0.1.9'), 1);
 
     await run(['hook', 'stop'], {
       env: hookEnv,
