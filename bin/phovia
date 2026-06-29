@@ -11,6 +11,9 @@ const { spawn } = require('child_process');
 
 const DEFAULT_BRAIN_URL = 'https://api.phovia.ai/api';
 const CLIENT = 'claude-code';
+const AGENT_ID = 'phovia-plugin';
+const DEFAULT_MODE = 'engineering';
+const MESSAGE_CONTENT_MAX = 8000;
 
 if (require.main === module) {
   main().catch((err) => {
@@ -165,16 +168,18 @@ async function recallMemory(input, event) {
 }
 
 async function stopHook(input) {
-  const transcript = readTranscriptTail(input.transcript_path);
+  const auth = readAuth();
+  if (!auth || !auth.access_token) return showLoginMessage();
+  if (!auth.device_id) return showLoginMessage();
+  const messages = buildIngestMessages(input);
+  if (!messages.length) return;
   const result = await authedPost('/insight/ingest', {
-    client: CLIENT,
-    event: 'Stop',
+    messages,
+    device_id: auth.device_id,
+    agent_type: CLIENT,
+    agent_id: AGENT_ID,
     session_id: input.session_id,
-    cwd: input.cwd,
-    stopped_at: new Date().toISOString(),
-    last_assistant_message: input.last_assistant_message || '',
-    transcript_tail: transcript.text,
-    transcript_tail_error: transcript.error
+    mode: DEFAULT_MODE
   });
   if (result.authNeeded) return showLoginMessage();
 }
@@ -400,20 +405,77 @@ function openBrowser(url) {
   child.unref();
 }
 
-function readTranscriptTail(file) {
-  if (!file) return { text: '', error: 'missing transcript_path' };
+function readTranscriptTailText(file) {
+  if (!file) return '';
   try {
     const p = file.startsWith('~/') ? path.join(os.homedir(), file.slice(2)) : file;
     const stat = fs.statSync(p);
-    const max = 120000;
+    const max = 1000000;
     const fd = fs.openSync(p, 'r');
     const start = Math.max(0, stat.size - max);
     const buf = Buffer.alloc(stat.size - start);
     fs.readSync(fd, buf, 0, buf.length, start);
     fs.closeSync(fd);
     const text = buf.toString('utf8');
-    return { text: start ? text.slice(text.indexOf('\n') + 1) : text };
-  } catch (err) { return { text: '', error: err.message }; }
+    return start ? text.slice(text.indexOf('\n') + 1) : text;
+  } catch (_) { return ''; }
+}
+
+function transcriptMessageText(message) {
+  if (!message) return '';
+  if (typeof message === 'string') return message.trim();
+  const content = message.content;
+  if (typeof content === 'string') return content.trim();
+  if (Array.isArray(content)) {
+    return content
+      .filter(block => block && block.type === 'text' && typeof block.text === 'string')
+      .map(block => block.text)
+      .join('\n')
+      .trim();
+  }
+  return '';
+}
+
+// The backend ingest unit is a single conversation turn. Parse the transcript
+// tail (Claude Code JSONL) and return the last user/assistant exchange.
+function readLastTurn(file) {
+  const out = { user: '', assistant: '' };
+  const text = readTranscriptTailText(file);
+  if (!text) return out;
+  const seq = [];
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    let obj;
+    try { obj = JSON.parse(line); } catch (_) { continue; }
+    if (obj.type !== 'user' && obj.type !== 'assistant') continue;
+    const messageText = transcriptMessageText(obj.message);
+    if (!messageText) continue;
+    seq.push({ role: obj.type, text: messageText });
+  }
+  for (let i = seq.length - 1; i >= 0; i--) {
+    if (seq[i].role !== 'assistant') continue;
+    out.assistant = seq[i].text;
+    for (let j = i - 1; j >= 0; j--) {
+      if (seq[j].role === 'user') { out.user = seq[j].text; break; }
+    }
+    break;
+  }
+  return out;
+}
+
+function clampContent(value) {
+  const trimmed = (value || '').trim();
+  return trimmed.length > MESSAGE_CONTENT_MAX ? trimmed.slice(0, MESSAGE_CONTENT_MAX) : trimmed;
+}
+
+function buildIngestMessages(input) {
+  const turn = readLastTurn(input.transcript_path);
+  const messages = [];
+  const user = clampContent(turn.user);
+  if (user) messages.push({ role: 'user', content: user });
+  const assistant = clampContent(input.last_assistant_message || turn.assistant);
+  if (assistant) messages.push({ role: 'assistant', content: assistant });
+  return messages;
 }
 
 function formatRecall(body) {

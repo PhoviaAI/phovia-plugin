@@ -148,7 +148,7 @@ function send(res, status, body) {
   const transcript = path.join(tmp, 'transcript.jsonl');
   const hookEnv = { PHOVIA_TOKEN_FILE: tokenFile, PHOVIA_SESSION_DIR: sessionDir };
   const marker = sessionId => path.join(sessionDir, `${encodeURIComponent(sessionId)}.loaded`);
-  fs.writeFileSync(transcript, '{"type":"user","message":"hello"}\n');
+  fs.writeFileSync(transcript, '{"type":"user","message":{"role":"user","content":"hello"}}\n{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi there"}]}}\n');
   const { server, url } = await startBrain();
   try {
     const login = await run(['login', '--brain', url, '--no-browser'], { env: hookEnv });
@@ -222,8 +222,16 @@ function send(res, status, body) {
       input: JSON.stringify({ hook_event_name: 'Stop', session_id: 's1', cwd: tmp, transcript_path: transcript, last_assistant_message: 'done' })
     });
     const ingest = requests.find(r => r.path === '/api/insight/ingest');
-    assert.match(ingest.body.transcript_tail, /hello/);
-    assert.strictEqual(ingest.body.transcript_tail_error, undefined);
+    assert.deepStrictEqual(ingest.body.messages, [
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: 'done' }
+    ]);
+    assert.strictEqual(ingest.body.agent_type, 'claude-code');
+    assert.strictEqual(ingest.body.agent_id, 'phovia-plugin');
+    assert.strictEqual(ingest.body.session_id, 's1');
+    assert.strictEqual(ingest.body.mode, 'engineering');
+    assert.ok(ingest.body.device_id, 'ingest must include device_id');
+    assert.strictEqual(ingest.body.transcript_tail, undefined);
 
     auth.access_token = 'old-access';
     fs.writeFileSync(tokenFile, JSON.stringify(auth), { mode: 0o600 });
