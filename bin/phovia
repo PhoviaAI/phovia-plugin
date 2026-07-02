@@ -548,16 +548,12 @@ function socketHasListener(file) {
 }
 
 function releaseSpoolLock(lock) {
+  // Unlink while this server is still the path owner. Never unlink in the close
+  // callback: a new worker may already have rebound the same path by then.
+  removeFile(lock.file);
   return new Promise((resolve) => {
-    try {
-      lock.server.close(() => {
-        removeFile(lock.file);
-        resolve();
-      });
-    } catch (_) {
-      removeFile(lock.file);
-      resolve();
-    }
+    try { lock.server.close(resolve); }
+    catch (_) { resolve(); }
   });
 }
 
