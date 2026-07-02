@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 const http = require('http');
 const https = require('https');
+const net = require('net');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 
@@ -408,14 +409,12 @@ function startSpoolFlush() {
 }
 
 async function flushSpool() {
-  const lock = acquireSpoolLock();
+  const lock = await acquireSpoolLock();
   if (!lock) return;
-  const heartbeat = startSpoolLockHeartbeat(lock);
   try {
     await flushSpoolLocked();
   } finally {
-    stopSpoolLockHeartbeat(heartbeat);
-    releaseSpoolLock(lock);
+    await releaseSpoolLock(lock);
   }
 }
 
@@ -423,11 +422,18 @@ async function flushSpoolLocked() {
   const auth = readAuth();
   if (!auth || !auth.access_token || !auth.device_id) return;
   if (!brainUrlForAuth(auth)) return;
+  recoverProcessingClaims();
   const entries = pruneSpool(0);
   for (const item of entries) {
-    const entry = item.entry || readJsonFile(item.file);
+    // The coarse process lock keeps normal replay single-worker, but stale-lock
+    // recovery may intentionally let a later worker continue. Claim each file
+    // with an atomic rename before posting so even a resumed older worker cannot
+    // submit a payload that another worker already took.
+    const claim = claimSpoolEntry(item.file);
+    if (!claim) continue;
+    const entry = readJsonFile(claim.file);
     if (!entry || !entry.body || (entry.api_path && entry.api_path !== '/insight/ingest')) {
-      removeFile(item.file);
+      removeFile(claim.file);
       continue;
     }
     const body = Object.assign({}, entry.body);
@@ -437,60 +443,126 @@ async function flushSpoolLocked() {
     if (!body.mode) body.mode = DEFAULT_MODE;
     const result = await authedPost('/insight/ingest', body);
     if (!result.ok) {
-      if (shouldSpoolIngestFailure(result)) break;
-      logIngestDrop(body, result, item.file);
+      if (shouldSpoolIngestFailure(result)) {
+        unclaimSpoolEntry(claim);
+        break;
+      }
+      logIngestDrop(body, result, claim.file);
     }
-    removeFile(item.file);
+    removeFile(claim.file);
   }
   pruneSpool(0);
 }
 
-function acquireSpoolLock() {
+function claimSpoolEntry(file) {
+  try {
+    const claimed = `${file}.${process.pid}.${crypto.randomUUID()}.processing`;
+    fs.renameSync(file, claimed);
+    return { original: file, file: claimed };
+  } catch (_) { return null; }
+}
+
+function unclaimSpoolEntry(claim) {
+  try { fs.renameSync(claim.file, claim.original); }
+  catch (_) { removeFile(claim.file); }
+}
+
+function recoverProcessingClaims() {
+  let names;
+  try { names = fs.readdirSync(spoolDir()); } catch (_) { return; }
+  for (const name of names) {
+    if (!name.endsWith('.processing')) continue;
+    const file = path.join(spoolDir(), name);
+    const original = originalSpoolFileForClaim(file) || path.join(spoolDir(), `${Date.now()}-${crypto.randomUUID()}.json`);
+    const target = fs.existsSync(original) ? recoveredSpoolFile(original) : original;
+    try { fs.renameSync(file, target); }
+    catch (_) { removeFile(file); }
+  }
+}
+
+function originalSpoolFileForClaim(file) {
+  const match = file.match(/^(.*\.json)\.\d+\.[0-9a-f-]+\.processing$/i);
+  return match && path.dirname(match[1]) === spoolDir() ? match[1] : null;
+}
+
+function recoveredSpoolFile(original) {
+  const root = original.replace(/\.json$/i, '');
+  for (let i = 0; i < 10; i += 1) {
+    const candidate = `${root}.recovered-${crypto.randomUUID()}.json`;
+    if (!fs.existsSync(candidate)) return candidate;
+  }
+  return `${root}.recovered-${Date.now()}.json`;
+}
+
+async function acquireSpoolLock() {
   const file = spoolLockPath();
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     try { fs.chmodSync(path.dirname(file), 0o700); } catch (_) {}
-    const fd = fs.openSync(file, 'wx', 0o600);
-    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, created_at: new Date().toISOString() }) + '\n');
-    fs.closeSync(fd);
-    return file;
+    const server = net.createServer((socket) => socket.end());
+    await listenSocket(server, file);
+    return { file, server };
   } catch (err) {
-    if (err && err.code === 'EEXIST' && removeStaleSpoolLock(file)) return acquireSpoolLock();
+    if (err && err.code === 'EADDRINUSE' && !(await socketHasListener(file))) {
+      removeFile(file);
+      return acquireSpoolLock();
+    }
     return null;
   }
 }
 
-function releaseSpoolLock(file) {
-  removeFile(file);
+function listenSocket(server, file) {
+  return new Promise((resolve, reject) => {
+    const onError = (err) => {
+      server.off('listening', onListening);
+      reject(err);
+    };
+    const onListening = () => {
+      server.off('error', onError);
+      resolve();
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(file);
+  });
 }
 
-function startSpoolLockHeartbeat(file) {
-  const touch = () => {
+function socketHasListener(file) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection(file);
+    const timer = setTimeout(() => {
+      socket.destroy();
+      resolve(true);
+    }, 1000);
+    if (timer.unref) timer.unref();
+    socket.once('connect', () => {
+      clearTimeout(timer);
+      socket.end();
+      resolve(true);
+    });
+    socket.once('error', () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
+}
+
+function releaseSpoolLock(lock) {
+  return new Promise((resolve) => {
     try {
-      const now = new Date();
-      fs.utimesSync(file, now, now);
-    } catch (_) {}
-  };
-  const timer = setInterval(touch, 60 * 1000);
-  if (timer.unref) timer.unref();
-  return timer;
-}
-
-function stopSpoolLockHeartbeat(timer) {
-  try { clearInterval(timer); } catch (_) {}
+      lock.server.close(() => {
+        removeFile(lock.file);
+        resolve();
+      });
+    } catch (_) {
+      removeFile(lock.file);
+      resolve();
+    }
+  });
 }
 
 function spoolLockPath() {
-  return path.join(spoolDir(), '.flush.lock');
-}
-
-function removeStaleSpoolLock(file) {
-  try {
-    const stat = fs.statSync(file);
-    if (Date.now() - stat.mtimeMs < 10 * 60 * 1000) return false;
-    removeFile(file);
-    return true;
-  } catch (_) { return false; }
+  return path.join(spoolDir(), '.flush.sock');
 }
 
 function shouldSpoolIngestFailure(result) {

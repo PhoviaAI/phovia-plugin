@@ -661,14 +661,22 @@ function send(res, status, body) {
         api_path: '/insight/ingest',
         body: { messages: [{ role: 'user', content: 'after live lock' }], session_id: 'after-live-lock' }
       }));
-      const lockFile = path.join(spoolDir, '.flush.lock');
-      fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, created_at: new Date(Date.now() - 11 * 60 * 1000).toISOString() }));
-      const old = new Date(Date.now() - 11 * 60 * 1000);
-      fs.utimesSync(lockFile, old, old);
+      const lockFile = path.join(spoolDir, '.flush.sock');
+      fs.writeFileSync(lockFile, 'stale socket path from crashed worker');
       await run(['spool-flush'], { env });
       assert.strictEqual(ingests.length, 2, `expected stale lock recovery replay, got ${ingests.length}`);
       assert(!fs.existsSync(lockFile));
       assert.deepStrictEqual(fs.readdirSync(spoolDir).filter(name => name.endsWith('.json')), []);
+
+      const processingOriginal = path.join(spoolDir, 'processing.json');
+      fs.writeFileSync(`${processingOriginal}.999.00000000-0000-4000-8000-000000000000.processing`, JSON.stringify({
+        created_at: new Date().toISOString(),
+        api_path: '/insight/ingest',
+        body: { messages: [{ role: 'user', content: 'recovered processing' }], session_id: 'recovered-processing' }
+      }));
+      await run(['spool-flush'], { env });
+      assert.strictEqual(ingests.length, 3, `expected recovered processing replay, got ${ingests.length}`);
+      assert(!fs.readdirSync(spoolDir).some(name => name.endsWith('.processing')));
     } finally {
       server.close();
       fs.rmSync(tmp, { recursive: true, force: true });
