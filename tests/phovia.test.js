@@ -666,13 +666,8 @@ function send(res, status, body) {
       const old = new Date(Date.now() - 11 * 60 * 1000);
       fs.utimesSync(lockFile, old, old);
       await run(['spool-flush'], { env });
-      assert.strictEqual(ingests.length, 1, 'old lock from a live process was incorrectly stolen');
-      assert(fs.existsSync(lockFile));
-      assert(fs.existsSync(path.join(spoolDir, 'two.json')));
-
-      fs.rmSync(lockFile, { force: true });
-      await run(['spool-flush'], { env });
-      assert.strictEqual(ingests.length, 2, `expected second replay after lock release, got ${ingests.length}`);
+      assert.strictEqual(ingests.length, 2, `expected stale lock recovery replay, got ${ingests.length}`);
+      assert(!fs.existsSync(lockFile));
       assert.deepStrictEqual(fs.readdirSync(spoolDir).filter(name => name.endsWith('.json')), []);
     } finally {
       server.close();

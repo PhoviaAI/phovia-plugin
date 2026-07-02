@@ -486,24 +486,11 @@ function spoolLockPath() {
 
 function removeStaleSpoolLock(file) {
   try {
-    const lock = readJsonFile(file);
-    if (lock && processIsAlive(lock.pid)) return false;
     const stat = fs.statSync(file);
     if (Date.now() - stat.mtimeMs < 10 * 60 * 1000) return false;
     removeFile(file);
     return true;
   } catch (_) { return false; }
-}
-
-function processIsAlive(pid) {
-  const n = Number(pid);
-  if (!Number.isInteger(n) || n <= 0) return false;
-  try {
-    process.kill(n, 0);
-    return true;
-  } catch (err) {
-    return err && err.code === 'EPERM';
-  }
 }
 
 function shouldSpoolIngestFailure(result) {
