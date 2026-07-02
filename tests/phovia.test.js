@@ -655,6 +655,25 @@ function send(res, status, body) {
       await Promise.all([run(['spool-flush'], { env }), run(['spool-flush'], { env })]);
       assert.strictEqual(ingests.length, 1, `expected one replay, got ${ingests.length}`);
       assert.deepStrictEqual(fs.readdirSync(spoolDir).filter(name => name.endsWith('.json')), []);
+
+      fs.writeFileSync(path.join(spoolDir, 'two.json'), JSON.stringify({
+        created_at: new Date().toISOString(),
+        api_path: '/insight/ingest',
+        body: { messages: [{ role: 'user', content: 'after live lock' }], session_id: 'after-live-lock' }
+      }));
+      const lockFile = path.join(spoolDir, '.flush.lock');
+      fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, created_at: new Date(Date.now() - 11 * 60 * 1000).toISOString() }));
+      const old = new Date(Date.now() - 11 * 60 * 1000);
+      fs.utimesSync(lockFile, old, old);
+      await run(['spool-flush'], { env });
+      assert.strictEqual(ingests.length, 1, 'old lock from a live process was incorrectly stolen');
+      assert(fs.existsSync(lockFile));
+      assert(fs.existsSync(path.join(spoolDir, 'two.json')));
+
+      fs.rmSync(lockFile, { force: true });
+      await run(['spool-flush'], { env });
+      assert.strictEqual(ingests.length, 2, `expected second replay after lock release, got ${ingests.length}`);
+      assert.deepStrictEqual(fs.readdirSync(spoolDir).filter(name => name.endsWith('.json')), []);
     } finally {
       server.close();
       fs.rmSync(tmp, { recursive: true, force: true });

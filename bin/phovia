@@ -410,9 +410,11 @@ function startSpoolFlush() {
 async function flushSpool() {
   const lock = acquireSpoolLock();
   if (!lock) return;
+  const heartbeat = startSpoolLockHeartbeat(lock);
   try {
     await flushSpoolLocked();
   } finally {
+    stopSpoolLockHeartbeat(heartbeat);
     releaseSpoolLock(lock);
   }
 }
@@ -462,17 +464,46 @@ function releaseSpoolLock(file) {
   removeFile(file);
 }
 
+function startSpoolLockHeartbeat(file) {
+  const touch = () => {
+    try {
+      const now = new Date();
+      fs.utimesSync(file, now, now);
+    } catch (_) {}
+  };
+  const timer = setInterval(touch, 60 * 1000);
+  if (timer.unref) timer.unref();
+  return timer;
+}
+
+function stopSpoolLockHeartbeat(timer) {
+  try { clearInterval(timer); } catch (_) {}
+}
+
 function spoolLockPath() {
   return path.join(spoolDir(), '.flush.lock');
 }
 
 function removeStaleSpoolLock(file) {
   try {
+    const lock = readJsonFile(file);
+    if (lock && processIsAlive(lock.pid)) return false;
     const stat = fs.statSync(file);
     if (Date.now() - stat.mtimeMs < 10 * 60 * 1000) return false;
     removeFile(file);
     return true;
   } catch (_) { return false; }
+}
+
+function processIsAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch (err) {
+    return err && err.code === 'EPERM';
+  }
 }
 
 function shouldSpoolIngestFailure(result) {
