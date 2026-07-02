@@ -87,6 +87,21 @@ async function withProcessEnv(env, fn) {
   }
 }
 
+async function waitFor(condition, message, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      if (condition()) return;
+    } catch (err) {
+      lastError = err;
+    }
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  if (lastError) throw lastError;
+  throw new Error(message);
+}
+
 function makeVendoredBrainInsightSchemas(z) {
   // Vendored from Phovia brain src/application/contracts/insight.ts
   // (insightRecallRequestSchema / insightIngestRequestSchema). Keep this
@@ -475,6 +490,7 @@ function send(res, status, body) {
     const { server, url } = await startMiniBrain((req, res, body) => {
       if (req.url === '/api/insight/ingest') {
         ingests.push(body);
+        if (body.session_id === 'bad-permanent') return send(res, 400, { error: 'invalid_payload' });
         if (failIngest) send(res, 503, { error: 'offline' });
         else send(res, 200, { ok: true });
         return;
@@ -505,11 +521,33 @@ function send(res, status, body) {
         env: hookEnv,
         input: JSON.stringify({ hook_event_name: 'SessionStart', session_id: 'flush-s2', cwd: tmp })
       });
-      assert.deepStrictEqual(fs.readdirSync(spoolDir).filter(name => name.endsWith('.json')), []);
+      await waitFor(
+        () => fs.readdirSync(spoolDir).filter(name => name.endsWith('.json')).length === 0,
+        'spool did not drain after successful hook'
+      );
       assert.deepStrictEqual(ingests[1].messages, [
         { role: 'user', content: 'retry question' },
         { role: 'assistant', content: 'retry answer' }
       ]);
+
+      fs.writeFileSync(path.join(spoolDir, 'bad-permanent.json'), JSON.stringify({
+        created_at: new Date(Date.now() - 2000).toISOString(),
+        api_path: '/insight/ingest',
+        body: { messages: [{ role: 'user', content: 'bad permanent' }], session_id: 'bad-permanent' }
+      }));
+      fs.writeFileSync(path.join(spoolDir, 'good-after-bad.json'), JSON.stringify({
+        created_at: new Date(Date.now() - 1000).toISOString(),
+        api_path: '/insight/ingest',
+        body: { messages: [{ role: 'user', content: 'good after bad' }], session_id: 'good-after-bad' }
+      }));
+      await run(['hook', 'session-start'], {
+        env: hookEnv,
+        input: JSON.stringify({ hook_event_name: 'SessionStart', session_id: 'flush-s3', cwd: tmp })
+      });
+      await waitFor(
+        () => ingests.some(body => body.session_id === 'good-after-bad') && !fs.existsSync(path.join(spoolDir, 'bad-permanent.json')),
+        'permanent spool failure blocked newer valid replay'
+      );
 
       fs.mkdirSync(spoolDir, { recursive: true, mode: 0o700 });
       const oldDate = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
@@ -536,6 +574,54 @@ function send(res, status, body) {
       assert(capped.length <= 200, `spool cap exceeded with ${capped.length} files`);
       const entries = capped.map(name => JSON.parse(fs.readFileSync(path.join(spoolDir, name), 'utf8')));
       assert(!entries.some(entry => Date.parse(entry.created_at) < Date.now() - 7 * 24 * 60 * 60 * 1000), 'spool retained entries older than 7 days');
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await test('AC-20-5 successful hook output is not blocked by slow spool replay', async () => {
+    resetTestState();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-spool-nonblock-'));
+    const tokenFile = path.join(tmp, 'auth.json');
+    const stateDir = path.join(tmp, '.phovia');
+    const sessionDir = path.join(tmp, 'sessions');
+    const spoolDir = path.join(stateDir, 'spool');
+    let slowIngests = 0;
+    const { server, url } = await startMiniBrain((req, res) => {
+      if (req.url === '/api/insight/ingest') {
+        slowIngests += 1;
+        setTimeout(() => send(res, 200, { ok: true }), 1500);
+        return;
+      }
+      if (req.url === '/api/insight/recall') {
+        send(res, 200, { insights: ['fast recall'] });
+        return;
+      }
+      return false;
+    });
+    try {
+      writeTestAuth(tokenFile, url, { access_token: 'access-1', expires_at: new Date(Date.now() + 3600000).toISOString() });
+      fs.mkdirSync(spoolDir, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(spoolDir, 'slow.json'), JSON.stringify({
+        created_at: new Date().toISOString(),
+        api_path: '/insight/ingest',
+        body: { messages: [{ role: 'user', content: 'slow replay' }], session_id: 'slow-replay' }
+      }));
+      const t0 = Date.now();
+      const start = await run(['hook', 'session-start'], {
+        env: {
+          CLAUDE_PLUGIN_ROOT: path.join(__dirname, '..'),
+          PHOVIA_TOKEN_FILE: tokenFile,
+          PHOVIA_STATE_DIR: stateDir,
+          PHOVIA_SESSION_DIR: sessionDir,
+          PHOVIA_DISABLE_VERSION_CHECK: '1'
+        },
+        input: JSON.stringify({ hook_event_name: 'SessionStart', session_id: 'nonblock-s1', cwd: tmp })
+      });
+      assert(Date.now() - t0 < 1000, 'session-start waited for slow spool replay before returning recall output');
+      assert.match(JSON.parse(start.stdout).hookSpecificOutput.additionalContext, /fast recall/);
+      await waitFor(() => slowIngests > 0, 'background spool replay did not start');
     } finally {
       server.close();
       fs.rmSync(tmp, { recursive: true, force: true });

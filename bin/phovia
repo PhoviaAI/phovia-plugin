@@ -35,6 +35,7 @@ async function main() {
   if (cmd === 'status') return status(args);
   if (cmd === 'logout') return logout(args);
   if (cmd === 'hook') return hook(args[0]);
+  if (cmd === 'spool-flush') return flushSpool();
   throw new Error(`unknown command: ${cmd}`);
 }
 
@@ -139,7 +140,7 @@ async function sessionStart(input) {
     return;
   }
   markSessionLoaded(input);
-  await flushSpool();
+  startSpoolFlush();
   const context = result.context;
   if (!context && !staleNotice) return;
   const out = { hookSpecificOutput: { hookEventName: 'SessionStart' } };
@@ -153,7 +154,7 @@ async function userPrompt(input) {
   const result = await recallMemory(input, 'UserPromptSubmit');
   if (result.authNeeded || !result.ok) return;
   markSessionLoaded(input);
-  await flushSpool();
+  startSpoolFlush();
   if (result.context) hookJson({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: result.context } });
 }
 
@@ -204,10 +205,11 @@ async function stopHook(input) {
   }
   const result = await authedPost('/insight/ingest', body);
   if (result.ok) {
-    await flushSpool();
+    startSpoolFlush();
     return;
   }
-  spoolIngest(body, result.authNeeded ? 'auth_needed' : 'sync_failed');
+  if (shouldSpoolIngestFailure(result)) spoolIngest(body, result.authNeeded ? 'auth_needed' : 'sync_failed');
+  else logIngestDrop(body, result);
   if (result.authNeeded) return showLoginMessage();
 }
 
@@ -392,6 +394,19 @@ function spoolIngest(body, reason) {
   } catch (_) {}
 }
 
+function startSpoolFlush() {
+  if (process.env.PHOVIA_BACKGROUND_SPOOL_FLUSH === '1') return;
+  try {
+    const child = spawn(process.execPath, [__filename, 'spool-flush'], {
+      detached: true,
+      stdio: 'ignore',
+      env: Object.assign({}, process.env, { PHOVIA_BACKGROUND_SPOOL_FLUSH: '1' })
+    });
+    child.on('error', () => {});
+    child.unref();
+  } catch (_) {}
+}
+
 async function flushSpool() {
   const auth = readAuth();
   if (!auth || !auth.access_token || !auth.device_id) return;
@@ -409,10 +424,34 @@ async function flushSpool() {
     if (!body.agent_id) body.agent_id = AGENT_ID;
     if (!body.mode) body.mode = DEFAULT_MODE;
     const result = await authedPost('/insight/ingest', body);
-    if (!result.ok) break;
+    if (!result.ok) {
+      if (shouldSpoolIngestFailure(result)) break;
+      logIngestDrop(body, result, item.file);
+    }
     removeFile(item.file);
   }
   pruneSpool(0);
+}
+
+function shouldSpoolIngestFailure(result) {
+  if (result && result.authNeeded) return true;
+  return isRetryableStatus(result && result.status);
+}
+
+function isRetryableStatus(status) {
+  const n = Number(status || 0);
+  return n === 0 || n === 408 || n === 429 || n >= 500;
+}
+
+function logIngestDrop(body, result, file) {
+  writeLocalLog('ingest-spool.log', {
+    timestamp: new Date().toISOString(),
+    event: 'ingest_not_spooled',
+    status: (result && result.status) || 0,
+    body: (result && result.body) || null,
+    session_id: body && body.session_id,
+    spool_file: file ? path.basename(file) : undefined
+  });
 }
 
 function pruneSpool(reserve) {
