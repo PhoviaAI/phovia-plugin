@@ -408,6 +408,16 @@ function startSpoolFlush() {
 }
 
 async function flushSpool() {
+  const lock = acquireSpoolLock();
+  if (!lock) return;
+  try {
+    await flushSpoolLocked();
+  } finally {
+    releaseSpoolLock(lock);
+  }
+}
+
+async function flushSpoolLocked() {
   const auth = readAuth();
   if (!auth || !auth.access_token || !auth.device_id) return;
   if (!brainUrlForAuth(auth)) return;
@@ -431,6 +441,38 @@ async function flushSpool() {
     removeFile(item.file);
   }
   pruneSpool(0);
+}
+
+function acquireSpoolLock() {
+  const file = spoolLockPath();
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(path.dirname(file), 0o700); } catch (_) {}
+    const fd = fs.openSync(file, 'wx', 0o600);
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, created_at: new Date().toISOString() }) + '\n');
+    fs.closeSync(fd);
+    return file;
+  } catch (err) {
+    if (err && err.code === 'EEXIST' && removeStaleSpoolLock(file)) return acquireSpoolLock();
+    return null;
+  }
+}
+
+function releaseSpoolLock(file) {
+  removeFile(file);
+}
+
+function spoolLockPath() {
+  return path.join(spoolDir(), '.flush.lock');
+}
+
+function removeStaleSpoolLock(file) {
+  try {
+    const stat = fs.statSync(file);
+    if (Date.now() - stat.mtimeMs < 10 * 60 * 1000) return false;
+    removeFile(file);
+    return true;
+  } catch (_) { return false; }
 }
 
 function shouldSpoolIngestFailure(result) {

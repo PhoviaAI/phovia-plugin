@@ -628,6 +628,39 @@ function send(res, status, body) {
     }
   });
 
+  await test('AC-20-5 concurrent spool replay is locked to avoid duplicate ingest', async () => {
+    resetTestState();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-spool-lock-'));
+    const tokenFile = path.join(tmp, 'auth.json');
+    const stateDir = path.join(tmp, '.phovia');
+    const spoolDir = path.join(stateDir, 'spool');
+    const ingests = [];
+    const { server, url } = await startMiniBrain((req, res, body) => {
+      if (req.url === '/api/insight/ingest') {
+        ingests.push(body);
+        setTimeout(() => send(res, 200, { ok: true }), 300);
+        return;
+      }
+      return false;
+    });
+    try {
+      writeTestAuth(tokenFile, url, { access_token: 'access-1', expires_at: new Date(Date.now() + 3600000).toISOString() });
+      fs.mkdirSync(spoolDir, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(spoolDir, 'one.json'), JSON.stringify({
+        created_at: new Date().toISOString(),
+        api_path: '/insight/ingest',
+        body: { messages: [{ role: 'user', content: 'only once' }], session_id: 'only-once' }
+      }));
+      const env = { PHOVIA_TOKEN_FILE: tokenFile, PHOVIA_STATE_DIR: stateDir, PHOVIA_DISABLE_VERSION_CHECK: '1' };
+      await Promise.all([run(['spool-flush'], { env }), run(['spool-flush'], { env })]);
+      assert.strictEqual(ingests.length, 1, `expected one replay, got ${ingests.length}`);
+      assert.deepStrictEqual(fs.readdirSync(spoolDir).filter(name => name.endsWith('.json')), []);
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   resetTestState();
   const brainSchemas = await test('AC-20-6 existing tests pass with brain contract guardrails', async () => {
     const schemas = makeVendoredBrainInsightSchemas(z);
