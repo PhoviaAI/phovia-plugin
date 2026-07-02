@@ -18,6 +18,90 @@ let manifestVersion = '9.9.9';
 
 const phovia = require(path.join(__dirname, '..', 'bin', 'phovia'));
 
+async function test(name, fn) {
+  try {
+    const result = await fn();
+    console.log(`ok ${name}`);
+    return result;
+  } catch (err) {
+    err.message = `${name}: ${err.message}`;
+    throw err;
+  }
+}
+
+function resetTestState() {
+  requests.length = 0;
+  contractViolations.length = 0;
+  failRecallSessions.clear();
+  tokenPolls = 0;
+  manifestVersion = '9.9.9';
+}
+
+async function startMiniBrain(handler) {
+  const server = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', c => { raw += c; });
+    req.on('end', () => {
+      let body = {};
+      try { body = raw ? JSON.parse(raw) : {}; } catch (_) {}
+      requests.push({ path: req.url, auth: req.headers.authorization, body });
+      try {
+        if (handler(req, res, body) !== false) return;
+      } catch (err) {
+        send(res, 500, { error: err.message });
+        return;
+      }
+      send(res, 404, { error: 'not_found' });
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  return { server, url: `http://127.0.0.1:${server.address().port}/api` };
+}
+
+function writeTestAuth(file, brainUrl, fields = {}) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, JSON.stringify({
+    brain_url: brainUrl,
+    access_token: 'old-access',
+    refresh_token: 'refresh-1',
+    device_id: 'device-1',
+    token_type: 'Bearer',
+    expires_at: '2000-01-01T00:00:00.000Z',
+    ...fields
+  }) + '\n', { mode: 0o600 });
+}
+
+async function withProcessEnv(env, fn) {
+  const old = {};
+  for (const key of Object.keys(env)) {
+    old[key] = process.env[key];
+    process.env[key] = env[key];
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const key of Object.keys(env)) {
+      if (old[key] === undefined) delete process.env[key];
+      else process.env[key] = old[key];
+    }
+  }
+}
+
+async function waitFor(condition, message, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      if (condition()) return;
+    } catch (err) {
+      lastError = err;
+    }
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  if (lastError) throw lastError;
+  throw new Error(message);
+}
+
 function makeVendoredBrainInsightSchemas(z) {
   // Vendored from Phovia brain src/application/contracts/insight.ts
   // (insightRecallRequestSchema / insightIngestRequestSchema). Keep this
@@ -246,8 +330,365 @@ function send(res, status, body) {
 }
 
 (async () => {
-  const brainSchemas = makeVendoredBrainInsightSchemas(z);
-  assertInsightSchemaGuardrails(brainSchemas);
+  await test('AC-20-1 refresh sends only refresh_token to strict brain schema', async () => {
+    resetTestState();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-refresh-strict-'));
+    const tokenFile = path.join(tmp, 'auth.json');
+    const stateDir = path.join(tmp, '.phovia');
+    const { server, url } = await startMiniBrain((req, res, body) => {
+      if (req.url === '/api/auth/token/refresh') {
+        if (JSON.stringify(Object.keys(body).sort()) !== JSON.stringify(['refresh_token'])) {
+          send(res, 400, { error: 'invalid_request', message: 'Unrecognized key' });
+          return;
+        }
+        assert.strictEqual(body.refresh_token, 'refresh-strict');
+        send(res, 200, { access_token: 'access-2', expires_in: 3600, token_type: 'Bearer' });
+        return;
+      }
+      if (req.url === '/api/insight/recall') {
+        assert.strictEqual(req.headers.authorization, 'Bearer access-2');
+        send(res, 200, { insights: ['strict refresh ok'] });
+        return;
+      }
+      return false;
+    });
+    try {
+      writeTestAuth(tokenFile, url, { refresh_token: 'refresh-strict' });
+      await withProcessEnv({ PHOVIA_TOKEN_FILE: tokenFile, PHOVIA_STATE_DIR: stateDir }, async () => {
+        const result = await phovia.authedPost('/insight/recall', { topic: 'strict-refresh' });
+        assert.strictEqual(result.ok, true, JSON.stringify(result));
+      });
+      const refreshReq = requests.find(r => r.path === '/api/auth/token/refresh');
+      assert(refreshReq, 'expected refresh request');
+      assert.deepStrictEqual(refreshReq.body, { refresh_token: 'refresh-strict' });
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await test('AC-20-2 refresh 5xx stays retryable without login; invalid_grant asks for login', async () => {
+    resetTestState();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-refresh-classify-'));
+    const tokenFile = path.join(tmp, 'auth.json');
+    const stateDir = path.join(tmp, '.phovia');
+    let refreshResponse = { status: 503, body: { error: 'offline' } };
+    const { server, url } = await startMiniBrain((req, res) => {
+      if (req.url === '/api/auth/token/refresh') {
+        send(res, refreshResponse.status, refreshResponse.body);
+        return;
+      }
+      if (req.url === '/api/insight/recall') {
+        send(res, 401, { error: 'expired' });
+        return;
+      }
+      return false;
+    });
+    try {
+      writeTestAuth(tokenFile, url);
+      await withProcessEnv({ PHOVIA_TOKEN_FILE: tokenFile, PHOVIA_STATE_DIR: stateDir }, async () => {
+        const retryable = await phovia.authedPost('/insight/recall', { topic: 'retryable-refresh' });
+        assert.strictEqual(retryable.authNeeded, undefined, JSON.stringify(retryable));
+        assert.strictEqual(retryable.ok, false, JSON.stringify(retryable));
+        assert.strictEqual(retryable.status, 503);
+
+        refreshResponse = { status: 400, body: { error: 'invalid_grant' } };
+        writeTestAuth(tokenFile, url);
+        const denied = await phovia.authedPost('/insight/recall', { topic: 'denied-refresh' });
+        assert.strictEqual(denied.authNeeded, true, JSON.stringify(denied));
+      });
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await test('AC-20-3 refresh failure writes status and response body to local diagnostics log', async () => {
+    resetTestState();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-refresh-log-'));
+    const tokenFile = path.join(tmp, 'auth.json');
+    const stateDir = path.join(tmp, '.phovia');
+    const { server, url } = await startMiniBrain((req, res) => {
+      if (req.url === '/api/auth/token/refresh') {
+        send(res, 503, { error: 'offline', detail: 'maintenance' });
+        return;
+      }
+      if (req.url === '/api/insight/recall') {
+        send(res, 401, { error: 'expired' });
+        return;
+      }
+      return false;
+    });
+    try {
+      writeTestAuth(tokenFile, url);
+      await withProcessEnv({ PHOVIA_TOKEN_FILE: tokenFile, PHOVIA_STATE_DIR: stateDir }, async () => {
+        await phovia.authedPost('/insight/recall', { topic: 'logged-refresh' });
+      });
+      const logPath = path.join(stateDir, 'auth-refresh.log');
+      const log = fs.readFileSync(logPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      assert(log.some(entry => entry.event === 'auth_refresh_failed' && entry.status === 503 && entry.body.error === 'offline' && entry.body.detail === 'maintenance'));
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await test('AC-20-4 afterTurn sync failure spools ingest payload instead of dropping it', async () => {
+    resetTestState();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-spool-write-'));
+    const tokenFile = path.join(tmp, 'auth.json');
+    const stateDir = path.join(tmp, '.phovia');
+    const sessionDir = path.join(tmp, 'sessions');
+    const transcript = path.join(tmp, 'transcript.jsonl');
+    fs.writeFileSync(transcript, '{"type":"user","message":{"role":"user","content":"offline question"}}\n');
+    const { server, url } = await startMiniBrain((req, res) => {
+      if (req.url === '/api/insight/ingest') {
+        send(res, 503, { error: 'offline' });
+        return;
+      }
+      return false;
+    });
+    try {
+      writeTestAuth(tokenFile, url, { access_token: 'access-1', expires_at: new Date(Date.now() + 3600000).toISOString() });
+      const hookEnv = {
+        PHOVIA_TOKEN_FILE: tokenFile,
+        PHOVIA_STATE_DIR: stateDir,
+        PHOVIA_SESSION_DIR: sessionDir,
+        PHOVIA_DISABLE_VERSION_CHECK: '1'
+      };
+      const stopped = await run(['hook', 'stop'], {
+        env: hookEnv,
+        input: JSON.stringify({ hook_event_name: 'Stop', session_id: 'spool-s1', cwd: tmp, transcript_path: transcript, last_assistant_message: 'offline answer' })
+      });
+      assert.strictEqual(stopped.stdout, '');
+      const files = fs.readdirSync(path.join(stateDir, 'spool')).filter(name => name.endsWith('.json'));
+      assert.strictEqual(files.length, 1);
+      const spooled = JSON.parse(fs.readFileSync(path.join(stateDir, 'spool', files[0]), 'utf8'));
+      assert.strictEqual(spooled.api_path, '/insight/ingest');
+      assert.deepStrictEqual(spooled.body.messages, [
+        { role: 'user', content: 'offline question' },
+        { role: 'assistant', content: 'offline answer' }
+      ]);
+      assert.strictEqual(spooled.body.session_id, 'spool-s1');
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await test('AC-20-5 next successful hook drains spool and retention cap keeps it bounded', async () => {
+    resetTestState();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-spool-flush-'));
+    const tokenFile = path.join(tmp, 'auth.json');
+    const stateDir = path.join(tmp, '.phovia');
+    const sessionDir = path.join(tmp, 'sessions');
+    const spoolDir = path.join(stateDir, 'spool');
+    const transcript = path.join(tmp, 'transcript.jsonl');
+    const ingests = [];
+    let failIngest = true;
+    fs.writeFileSync(transcript, '{"type":"user","message":{"role":"user","content":"retry question"}}\n');
+    const { server, url } = await startMiniBrain((req, res, body) => {
+      if (req.url === '/api/insight/ingest') {
+        ingests.push(body);
+        if (body.session_id === 'bad-permanent') return send(res, 400, { error: 'invalid_payload' });
+        if (failIngest) send(res, 503, { error: 'offline' });
+        else send(res, 200, { ok: true });
+        return;
+      }
+      if (req.url === '/api/insight/recall') {
+        send(res, 200, { insights: ['connected'] });
+        return;
+      }
+      return false;
+    });
+    try {
+      writeTestAuth(tokenFile, url, { access_token: 'access-1', expires_at: new Date(Date.now() + 3600000).toISOString() });
+      const hookEnv = {
+        CLAUDE_PLUGIN_ROOT: path.join(__dirname, '..'),
+        PHOVIA_TOKEN_FILE: tokenFile,
+        PHOVIA_STATE_DIR: stateDir,
+        PHOVIA_SESSION_DIR: sessionDir,
+        PHOVIA_DISABLE_VERSION_CHECK: '1'
+      };
+      await run(['hook', 'stop'], {
+        env: hookEnv,
+        input: JSON.stringify({ hook_event_name: 'Stop', session_id: 'flush-s1', cwd: tmp, transcript_path: transcript, last_assistant_message: 'retry answer' })
+      });
+      assert.strictEqual(fs.readdirSync(spoolDir).filter(name => name.endsWith('.json')).length, 1);
+
+      failIngest = false;
+      await run(['hook', 'session-start'], {
+        env: hookEnv,
+        input: JSON.stringify({ hook_event_name: 'SessionStart', session_id: 'flush-s2', cwd: tmp })
+      });
+      await waitFor(
+        () => fs.readdirSync(spoolDir).filter(name => name.endsWith('.json')).length === 0,
+        'spool did not drain after successful hook'
+      );
+      assert.deepStrictEqual(ingests[1].messages, [
+        { role: 'user', content: 'retry question' },
+        { role: 'assistant', content: 'retry answer' }
+      ]);
+
+      fs.writeFileSync(path.join(spoolDir, 'bad-permanent.json'), JSON.stringify({
+        created_at: new Date(Date.now() - 2000).toISOString(),
+        api_path: '/insight/ingest',
+        body: { messages: [{ role: 'user', content: 'bad permanent' }], session_id: 'bad-permanent' }
+      }));
+      fs.writeFileSync(path.join(spoolDir, 'good-after-bad.json'), JSON.stringify({
+        created_at: new Date(Date.now() - 1000).toISOString(),
+        api_path: '/insight/ingest',
+        body: { messages: [{ role: 'user', content: 'good after bad' }], session_id: 'good-after-bad' }
+      }));
+      await run(['hook', 'session-start'], {
+        env: hookEnv,
+        input: JSON.stringify({ hook_event_name: 'SessionStart', session_id: 'flush-s3', cwd: tmp })
+      });
+      await waitFor(
+        () => ingests.some(body => body.session_id === 'good-after-bad') && !fs.existsSync(path.join(spoolDir, 'bad-permanent.json')),
+        'permanent spool failure blocked newer valid replay'
+      );
+
+      fs.mkdirSync(spoolDir, { recursive: true, mode: 0o700 });
+      const oldDate = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+      for (let i = 0; i < 3; i += 1) {
+        fs.writeFileSync(path.join(spoolDir, `old-${i}.json`), JSON.stringify({
+          created_at: oldDate,
+          api_path: '/insight/ingest',
+          body: { messages: [{ role: 'user', content: `old ${i}` }], session_id: `old-${i}` }
+        }));
+      }
+      for (let i = 0; i < 205; i += 1) {
+        fs.writeFileSync(path.join(spoolDir, `fresh-${String(i).padStart(3, '0')}.json`), JSON.stringify({
+          created_at: new Date(Date.now() - (205 - i) * 1000).toISOString(),
+          api_path: '/insight/ingest',
+          body: { messages: [{ role: 'user', content: `fresh ${i}` }], session_id: `fresh-${i}` }
+        }));
+      }
+      failIngest = true;
+      await run(['hook', 'stop'], {
+        env: hookEnv,
+        input: JSON.stringify({ hook_event_name: 'Stop', session_id: 'cap-s1', cwd: tmp, transcript_path: transcript, last_assistant_message: 'cap answer' })
+      });
+      const capped = fs.readdirSync(spoolDir).filter(name => name.endsWith('.json'));
+      assert(capped.length <= 200, `spool cap exceeded with ${capped.length} files`);
+      const entries = capped.map(name => JSON.parse(fs.readFileSync(path.join(spoolDir, name), 'utf8')));
+      assert(!entries.some(entry => Date.parse(entry.created_at) < Date.now() - 7 * 24 * 60 * 60 * 1000), 'spool retained entries older than 7 days');
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await test('AC-20-5 successful hook output is not blocked by slow spool replay', async () => {
+    resetTestState();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-spool-nonblock-'));
+    const tokenFile = path.join(tmp, 'auth.json');
+    const stateDir = path.join(tmp, '.phovia');
+    const sessionDir = path.join(tmp, 'sessions');
+    const spoolDir = path.join(stateDir, 'spool');
+    let slowIngests = 0;
+    const { server, url } = await startMiniBrain((req, res) => {
+      if (req.url === '/api/insight/ingest') {
+        slowIngests += 1;
+        setTimeout(() => send(res, 200, { ok: true }), 1500);
+        return;
+      }
+      if (req.url === '/api/insight/recall') {
+        send(res, 200, { insights: ['fast recall'] });
+        return;
+      }
+      return false;
+    });
+    try {
+      writeTestAuth(tokenFile, url, { access_token: 'access-1', expires_at: new Date(Date.now() + 3600000).toISOString() });
+      fs.mkdirSync(spoolDir, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(spoolDir, 'slow.json'), JSON.stringify({
+        created_at: new Date().toISOString(),
+        api_path: '/insight/ingest',
+        body: { messages: [{ role: 'user', content: 'slow replay' }], session_id: 'slow-replay' }
+      }));
+      const t0 = Date.now();
+      const start = await run(['hook', 'session-start'], {
+        env: {
+          CLAUDE_PLUGIN_ROOT: path.join(__dirname, '..'),
+          PHOVIA_TOKEN_FILE: tokenFile,
+          PHOVIA_STATE_DIR: stateDir,
+          PHOVIA_SESSION_DIR: sessionDir,
+          PHOVIA_DISABLE_VERSION_CHECK: '1'
+        },
+        input: JSON.stringify({ hook_event_name: 'SessionStart', session_id: 'nonblock-s1', cwd: tmp })
+      });
+      assert(Date.now() - t0 < 1000, 'session-start waited for slow spool replay before returning recall output');
+      assert.match(JSON.parse(start.stdout).hookSpecificOutput.additionalContext, /fast recall/);
+      await waitFor(() => slowIngests > 0, 'background spool replay did not start');
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await test('AC-20-5 concurrent spool replay is locked to avoid duplicate ingest', async () => {
+    resetTestState();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-spool-lock-'));
+    const tokenFile = path.join(tmp, 'auth.json');
+    const stateDir = path.join(tmp, '.phovia');
+    const spoolDir = path.join(stateDir, 'spool');
+    const ingests = [];
+    const { server, url } = await startMiniBrain((req, res, body) => {
+      if (req.url === '/api/insight/ingest') {
+        ingests.push(body);
+        setTimeout(() => send(res, 200, { ok: true }), 300);
+        return;
+      }
+      return false;
+    });
+    try {
+      writeTestAuth(tokenFile, url, { access_token: 'access-1', expires_at: new Date(Date.now() + 3600000).toISOString() });
+      fs.mkdirSync(spoolDir, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(spoolDir, 'one.json'), JSON.stringify({
+        created_at: new Date().toISOString(),
+        api_path: '/insight/ingest',
+        body: { messages: [{ role: 'user', content: 'only once' }], session_id: 'only-once' }
+      }));
+      const env = { PHOVIA_TOKEN_FILE: tokenFile, PHOVIA_STATE_DIR: stateDir, PHOVIA_DISABLE_VERSION_CHECK: '1' };
+      await Promise.all([run(['spool-flush'], { env }), run(['spool-flush'], { env })]);
+      assert.strictEqual(ingests.length, 1, `expected one replay, got ${ingests.length}`);
+      assert.deepStrictEqual(fs.readdirSync(spoolDir).filter(name => name.endsWith('.json')), []);
+
+      fs.writeFileSync(path.join(spoolDir, 'two.json'), JSON.stringify({
+        created_at: new Date().toISOString(),
+        api_path: '/insight/ingest',
+        body: { messages: [{ role: 'user', content: 'after live lock' }], session_id: 'after-live-lock' }
+      }));
+      const lockFile = path.join(spoolDir, '.flush.sock');
+      fs.writeFileSync(lockFile, 'stale socket path from crashed worker');
+      await run(['spool-flush'], { env });
+      assert.strictEqual(ingests.length, 2, `expected stale lock recovery replay, got ${ingests.length}`);
+      assert(!fs.existsSync(lockFile));
+      assert.deepStrictEqual(fs.readdirSync(spoolDir).filter(name => name.endsWith('.json')), []);
+
+      const processingOriginal = path.join(spoolDir, 'processing.json');
+      fs.writeFileSync(`${processingOriginal}.999.00000000-0000-4000-8000-000000000000.processing`, JSON.stringify({
+        created_at: new Date().toISOString(),
+        api_path: '/insight/ingest',
+        body: { messages: [{ role: 'user', content: 'recovered processing' }], session_id: 'recovered-processing' }
+      }));
+      await run(['spool-flush'], { env });
+      assert.strictEqual(ingests.length, 3, `expected recovered processing replay, got ${ingests.length}`);
+      assert(!fs.readdirSync(spoolDir).some(name => name.endsWith('.processing')));
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  resetTestState();
+  const brainSchemas = await test('AC-20-6 existing tests pass with brain contract guardrails', async () => {
+    const schemas = makeVendoredBrainInsightSchemas(z);
+    assertInsightSchemaGuardrails(schemas);
+    return schemas;
+  });
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-test-'));
   const tokenFile = path.join(tmp, 'auth.json');
   const sessionDir = path.join(tmp, 'sessions');

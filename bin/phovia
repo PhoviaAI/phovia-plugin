@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 const http = require('http');
 const https = require('https');
+const net = require('net');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 
@@ -17,6 +18,8 @@ const MESSAGE_CONTENT_MAX = 8000;
 const DEFAULT_REPO = 'PhoviaAI/phovia-plugin';
 const DEFAULT_VERSION_TTL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_VERSION_TIMEOUT_MS = 2000;
+const SPOOL_MAX_ENTRIES = 200;
+const SPOOL_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 if (require.main === module) {
   main().catch((err) => {
@@ -33,6 +36,7 @@ async function main() {
   if (cmd === 'status') return status(args);
   if (cmd === 'logout') return logout(args);
   if (cmd === 'hook') return hook(args[0]);
+  if (cmd === 'spool-flush') return flushSpool();
   throw new Error(`unknown command: ${cmd}`);
 }
 
@@ -137,6 +141,7 @@ async function sessionStart(input) {
     return;
   }
   markSessionLoaded(input);
+  startSpoolFlush();
   const context = result.context;
   if (!context && !staleNotice) return;
   const out = { hookSpecificOutput: { hookEventName: 'SessionStart' } };
@@ -150,6 +155,7 @@ async function userPrompt(input) {
   const result = await recallMemory(input, 'UserPromptSubmit');
   if (result.authNeeded || !result.ok) return;
   markSessionLoaded(input);
+  startSpoolFlush();
   if (result.context) hookJson({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: result.context } });
 }
 
@@ -184,18 +190,27 @@ async function recallMemory(input, event) {
 
 async function stopHook(input) {
   const auth = readAuth();
-  if (!auth || !auth.access_token) return showLoginMessage();
-  if (!auth.device_id) return showLoginMessage();
   const messages = buildIngestMessages(input);
   if (!messages.length) return;
-  const result = await authedPost('/insight/ingest', {
+  const body = {
     messages,
-    device_id: auth.device_id,
+    device_id: auth && auth.device_id,
     agent_type: CLIENT,
     agent_id: AGENT_ID,
     session_id: input.session_id,
     mode: DEFAULT_MODE
-  });
+  };
+  if (!auth || !auth.access_token || !auth.device_id) {
+    spoolIngest(body, 'auth_missing');
+    return showLoginMessage();
+  }
+  const result = await authedPost('/insight/ingest', body);
+  if (result.ok) {
+    startSpoolFlush();
+    return;
+  }
+  if (shouldSpoolIngestFailure(result)) spoolIngest(body, result.authNeeded ? 'auth_needed' : 'sync_failed');
+  else logIngestDrop(body, result);
   if (result.authNeeded) return showLoginMessage();
 }
 
@@ -205,15 +220,26 @@ async function authedPost(apiPath, body) {
   const brainUrl = brainUrlForAuth(auth);
   if (!brainUrl) return { authNeeded: true };
   let current = auth;
-  if (isExpired(current)) current = await refresh(current, brainUrl) || current;
+  if (isExpired(current)) {
+    const refreshed = await refresh(current, brainUrl);
+    if (refreshed.ok) current = refreshed.auth;
+    else if (refreshed.authNeeded) return { authNeeded: true, status: refreshed.status, body: refreshed.body };
+    else return { ok: false, status: refreshed.status, body: refreshed.body };
+  }
   let res = await insightPost(brainUrl, apiPath, body, bearer(current.access_token));
   if (res.status === 401) {
-    current = await refresh(current, brainUrl);
-    if (!current) return { authNeeded: true };
-    res = await insightPost(brainUrl, apiPath, body, bearer(current.access_token));
+    const refreshed = await refresh(current, brainUrl);
+    if (refreshed.ok) {
+      current = refreshed.auth;
+      res = await insightPost(brainUrl, apiPath, body, bearer(current.access_token));
+    } else if (refreshed.authNeeded) {
+      return { authNeeded: true, status: refreshed.status, body: refreshed.body };
+    } else {
+      return { ok: false, status: refreshed.status, body: refreshed.body };
+    }
   }
-  if (res.status === 401) return { authNeeded: true };
-  return { ok: res.status >= 200 && res.status < 300, body: res.json || res.text };
+  if (res.status === 401) return { authNeeded: true, status: res.status, body: res.json || res.text };
+  return { ok: res.status >= 200 && res.status < 300, status: res.status, body: res.json || res.text };
 }
 
 
@@ -242,17 +268,44 @@ function hasApiBase(base) {
 }
 
 async function refresh(auth, brainUrl) {
-  if (!auth || !auth.refresh_token) return null;
+  if (!auth || !auth.refresh_token) {
+    return { ok: false, authNeeded: true, status: 0, body: { error: 'missing_refresh_token' } };
+  }
   const res = await jsonRequest('POST', authUrlFor(brainUrl, '/auth/token/refresh'), {
-    refresh_token: auth.refresh_token,
-    client: CLIENT,
-    device_id: auth.device_id
+    refresh_token: auth.refresh_token
   });
-  if (res.status < 200 || res.status >= 300) return null;
+  if (res.status < 200 || res.status >= 300) {
+    logRefreshFailure(res);
+    return {
+      ok: false,
+      authNeeded: refreshDeniedNeedsLogin(res),
+      status: res.status,
+      body: res.json || res.text
+    };
+  }
   const next = Object.assign({}, auth, tokenFields(res.json || {}), { brain_url: brainUrl, updated_at: new Date().toISOString() });
-  if (!next.access_token) return null;
+  if (!next.access_token) {
+    logRefreshFailure({ status: res.status, json: res.json || {}, text: res.text });
+    return { ok: false, status: res.status, body: res.json || res.text };
+  }
   writeAuth(next);
-  return next;
+  return { ok: true, auth: next };
+}
+
+function refreshDeniedNeedsLogin(res) {
+  if (res.status === 401) return true;
+  const body = res.json || {};
+  const error = body && (body.error || body.code || body.message || body.error_description);
+  return String(error || '').toLowerCase() === 'invalid_grant';
+}
+
+function logRefreshFailure(res) {
+  writeLocalLog('auth-refresh.log', {
+    timestamp: new Date().toISOString(),
+    event: 'auth_refresh_failed',
+    status: res.status || 0,
+    body: res.json || res.text || null
+  });
 }
 
 function saveTokens(brainUrl, deviceId, data) {
@@ -303,6 +356,265 @@ function fixAuthMode() {
 
 function authPath() {
   return process.env.PHOVIA_TOKEN_FILE || path.join(os.homedir(), '.phovia', 'auth.json');
+}
+
+function stateDir() {
+  return process.env.PHOVIA_STATE_DIR || path.dirname(authPath()) || path.join(os.homedir(), '.phovia');
+}
+
+function writeLocalLog(name, entry) {
+  try {
+    const dir = stateDir();
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(dir, 0o700); } catch (_) {}
+    const file = path.join(dir, name);
+    fs.appendFileSync(file, JSON.stringify(entry) + '\n', { mode: 0o600 });
+    try { fs.chmodSync(file, 0o600); } catch (_) {}
+  } catch (_) {}
+}
+
+function spoolDir() {
+  return path.join(stateDir(), 'spool');
+}
+
+function spoolIngest(body, reason) {
+  try {
+    pruneSpool(1);
+    fs.mkdirSync(spoolDir(), { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(spoolDir(), 0o700); } catch (_) {}
+    const entry = {
+      created_at: new Date().toISOString(),
+      reason,
+      api_path: '/insight/ingest',
+      body
+    };
+    const stamp = entry.created_at.replace(/[:.]/g, '-');
+    const file = path.join(spoolDir(), `${stamp}-${process.pid}-${crypto.randomUUID()}.json`);
+    fs.writeFileSync(file, JSON.stringify(entry, null, 2) + '\n', { mode: 0o600 });
+    try { fs.chmodSync(file, 0o600); } catch (_) {}
+  } catch (_) {}
+}
+
+function startSpoolFlush() {
+  if (process.env.PHOVIA_BACKGROUND_SPOOL_FLUSH === '1') return;
+  try {
+    const child = spawn(process.execPath, [__filename, 'spool-flush'], {
+      detached: true,
+      stdio: 'ignore',
+      env: Object.assign({}, process.env, { PHOVIA_BACKGROUND_SPOOL_FLUSH: '1' })
+    });
+    child.on('error', () => {});
+    child.unref();
+  } catch (_) {}
+}
+
+async function flushSpool() {
+  const lock = await acquireSpoolLock();
+  if (!lock) return;
+  try {
+    await flushSpoolLocked();
+  } finally {
+    await releaseSpoolLock(lock);
+  }
+}
+
+async function flushSpoolLocked() {
+  const auth = readAuth();
+  if (!auth || !auth.access_token || !auth.device_id) return;
+  if (!brainUrlForAuth(auth)) return;
+  recoverProcessingClaims();
+  const entries = pruneSpool(0);
+  for (const item of entries) {
+    // The coarse process lock keeps normal replay single-worker, but stale-lock
+    // recovery may intentionally let a later worker continue. Claim each file
+    // with an atomic rename before posting so even a resumed older worker cannot
+    // submit a payload that another worker already took.
+    const claim = claimSpoolEntry(item.file);
+    if (!claim) continue;
+    const entry = readJsonFile(claim.file);
+    if (!entry || !entry.body || (entry.api_path && entry.api_path !== '/insight/ingest')) {
+      removeFile(claim.file);
+      continue;
+    }
+    const body = Object.assign({}, entry.body);
+    if (!body.device_id) body.device_id = auth.device_id;
+    if (!body.agent_type) body.agent_type = CLIENT;
+    if (!body.agent_id) body.agent_id = AGENT_ID;
+    if (!body.mode) body.mode = DEFAULT_MODE;
+    const result = await authedPost('/insight/ingest', body);
+    if (!result.ok) {
+      if (shouldSpoolIngestFailure(result)) {
+        unclaimSpoolEntry(claim);
+        break;
+      }
+      logIngestDrop(body, result, claim.file);
+    }
+    removeFile(claim.file);
+  }
+  pruneSpool(0);
+}
+
+function claimSpoolEntry(file) {
+  try {
+    const claimed = `${file}.${process.pid}.${crypto.randomUUID()}.processing`;
+    fs.renameSync(file, claimed);
+    return { original: file, file: claimed };
+  } catch (_) { return null; }
+}
+
+function unclaimSpoolEntry(claim) {
+  try { fs.renameSync(claim.file, claim.original); }
+  catch (_) { removeFile(claim.file); }
+}
+
+function recoverProcessingClaims() {
+  let names;
+  try { names = fs.readdirSync(spoolDir()); } catch (_) { return; }
+  for (const name of names) {
+    if (!name.endsWith('.processing')) continue;
+    const file = path.join(spoolDir(), name);
+    const original = originalSpoolFileForClaim(file) || path.join(spoolDir(), `${Date.now()}-${crypto.randomUUID()}.json`);
+    const target = fs.existsSync(original) ? recoveredSpoolFile(original) : original;
+    try { fs.renameSync(file, target); }
+    catch (_) { removeFile(file); }
+  }
+}
+
+function originalSpoolFileForClaim(file) {
+  const match = file.match(/^(.*\.json)\.\d+\.[0-9a-f-]+\.processing$/i);
+  return match && path.dirname(match[1]) === spoolDir() ? match[1] : null;
+}
+
+function recoveredSpoolFile(original) {
+  const root = original.replace(/\.json$/i, '');
+  for (let i = 0; i < 10; i += 1) {
+    const candidate = `${root}.recovered-${crypto.randomUUID()}.json`;
+    if (!fs.existsSync(candidate)) return candidate;
+  }
+  return `${root}.recovered-${Date.now()}.json`;
+}
+
+async function acquireSpoolLock() {
+  const file = spoolLockPath();
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(path.dirname(file), 0o700); } catch (_) {}
+    const server = net.createServer((socket) => socket.end());
+    await listenSocket(server, file);
+    return { file, server };
+  } catch (err) {
+    if (err && err.code === 'EADDRINUSE' && !(await socketHasListener(file))) {
+      removeFile(file);
+      return acquireSpoolLock();
+    }
+    return null;
+  }
+}
+
+function listenSocket(server, file) {
+  return new Promise((resolve, reject) => {
+    const onError = (err) => {
+      server.off('listening', onListening);
+      reject(err);
+    };
+    const onListening = () => {
+      server.off('error', onError);
+      resolve();
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(file);
+  });
+}
+
+function socketHasListener(file) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection(file);
+    const timer = setTimeout(() => {
+      socket.destroy();
+      resolve(true);
+    }, 1000);
+    if (timer.unref) timer.unref();
+    socket.once('connect', () => {
+      clearTimeout(timer);
+      socket.end();
+      resolve(true);
+    });
+    socket.once('error', () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
+}
+
+function releaseSpoolLock(lock) {
+  // Unlink while this server is still the path owner. Never unlink in the close
+  // callback: a new worker may already have rebound the same path by then.
+  removeFile(lock.file);
+  return new Promise((resolve) => {
+    try { lock.server.close(resolve); }
+    catch (_) { resolve(); }
+  });
+}
+
+function spoolLockPath() {
+  return path.join(spoolDir(), '.flush.sock');
+}
+
+function shouldSpoolIngestFailure(result) {
+  if (result && result.authNeeded) return true;
+  return isRetryableStatus(result && result.status);
+}
+
+function isRetryableStatus(status) {
+  const n = Number(status || 0);
+  return n === 0 || n === 408 || n === 429 || n >= 500;
+}
+
+function logIngestDrop(body, result, file) {
+  writeLocalLog('ingest-spool.log', {
+    timestamp: new Date().toISOString(),
+    event: 'ingest_not_spooled',
+    status: (result && result.status) || 0,
+    body: (result && result.body) || null,
+    session_id: body && body.session_id,
+    spool_file: file ? path.basename(file) : undefined
+  });
+}
+
+function pruneSpool(reserve) {
+  const max = Math.max(0, SPOOL_MAX_ENTRIES - Number(reserve || 0));
+  let entries = listSpoolEntries();
+  const cutoff = Date.now() - SPOOL_MAX_AGE_MS;
+  for (const item of entries) {
+    if (item.createdAt < cutoff) removeFile(item.file);
+  }
+  entries = listSpoolEntries().sort((a, b) => a.createdAt - b.createdAt || a.file.localeCompare(b.file));
+  while (entries.length > max) {
+    const item = entries.shift();
+    removeFile(item.file);
+  }
+  return entries;
+}
+
+function listSpoolEntries() {
+  try {
+    return fs.readdirSync(spoolDir())
+      .filter(name => name.endsWith('.json'))
+      .map(name => {
+        const file = path.join(spoolDir(), name);
+        const entry = readJsonFile(file);
+        let createdAt = entry && entry.created_at ? Date.parse(entry.created_at) : NaN;
+        if (!Number.isFinite(createdAt)) {
+          try { createdAt = fs.statSync(file).mtimeMs; } catch (_) { createdAt = Date.now(); }
+        }
+        return { file, entry, createdAt };
+      });
+  } catch (_) { return []; }
+}
+
+function removeFile(file) {
+  try { fs.rmSync(file, { force: true }); } catch (_) {}
 }
 
 function sessionDir() {
