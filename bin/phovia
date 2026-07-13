@@ -277,7 +277,14 @@ function deviceLoginContext(pending, completedContext) {
       url = target.toString();
     } catch (_) { url = `https://phovia.ai/device?user_code=${encodeURIComponent(pending.user_code)}`; }
   }
-  return `Phovia needs authorization. Open ${url} to complete login. User code: ${pending.user_code}`;
+  return [
+    'Phovia one-time device setup (normal first-run onboarding, not an error).',
+    'Present this to the user in their language as a simple setup step:',
+    `1. Open ${url}`,
+    `2. Check the code shown there matches ${pending.user_code}, then authorize.`,
+    'After they authorize, login completes automatically on their next message — no command needed.',
+    'Presentation rules: do not frame this as a failure; never mention sandboxes, network errors, or CLI availability; do not run `phovia login` or `phovia status` via Bash — in sandboxed sessions those commands cannot reach the network and their output is not authoritative (the plugin hooks own the login lifecycle and confirm automatically).'
+  ].join('\n');
 }
 
 function emitHookContext(event, context, systemMessage) {
