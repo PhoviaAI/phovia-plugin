@@ -330,6 +330,97 @@ function send(res, status, body) {
 }
 
 (async () => {
+  await test('AC-23-1 AC-23-2 AC-23-3 AC-23-5 AC-23-6 AC-23-7 hook device state machine is silent, throttled, private, and idempotent', async () => {
+    resetTestState();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-hook-login-'));
+    const tokenFile = path.join(tmp, 'auth.json');
+    const pendingFile = path.join(tmp, 'pending-auth.json');
+    let starts = 0;
+    let polls = 0;
+    let pollResult = 'authorization_pending';
+    const { server, url } = await startMiniBrain((req, res) => {
+      if (req.url === '/api/auth/device/start') {
+        starts += 1;
+        setTimeout(() => send(res, 200, {
+          device_code: `device-code-${starts}`, user_code: `CODE-${starts}`,
+          verification_uri: 'https://phovia.ai/device', interval: 10, expires_in: 600
+        }), 50);
+        return;
+      }
+      if (req.url === '/api/auth/device/token') {
+        polls += 1;
+        if (pollResult !== 'authorized') return send(res, 400, { error: pollResult });
+        return send(res, 200, {
+          access_token: 'secret-access', refresh_token: 'secret-refresh', expires_in: 3600
+        });
+      }
+      if (req.url === '/api/insight/recall') return send(res, 200, { insights: ['remember desktop login'] });
+      return false;
+    });
+    const env = {
+      PHOVIA_TOKEN_FILE: tokenFile, PHOVIA_STATE_DIR: tmp, PHOVIA_BRAIN_URL: url,
+      PHOVIA_DISABLE_VERSION_CHECK: '1', PHOVIA_SESSION_DIR: path.join(tmp, 'sessions')
+    };
+    const hookInput = event => JSON.stringify({ hook_event_name: event, session_id: 'desktop-1', cwd: tmp });
+    try {
+      const concurrent = await Promise.all([
+        run(['hook', 'session-start'], { env, input: hookInput('SessionStart') }),
+        run(['hook', 'session-start'], { env, input: hookInput('SessionStart') })
+      ]);
+      assert.strictEqual(starts, 1, 'concurrent sessions must share one device start');
+      const guide = concurrent.find(result => result.stdout);
+      assert(guide, 'one session should inject the shared login guide');
+      assert.match(JSON.parse(guide.stdout).hookSpecificOutput.additionalContext, /phovia\.ai\/device\?user_code=CODE-1/);
+      assert.strictEqual(fs.statSync(pendingFile).mode & 0o777, 0o600);
+
+      const firstPoll = await run(['hook', 'user-prompt'], { env, input: hookInput('UserPromptSubmit') });
+      assert.strictEqual(firstPoll.stdout, '');
+      assert.strictEqual(polls, 1);
+      assert(JSON.parse(fs.readFileSync(pendingFile)).last_poll_at);
+      await run(['hook', 'stop'], { env, input: hookInput('Stop') });
+      assert.strictEqual(polls, 1, 'rapid hooks must not exceed interval');
+
+      const pending = JSON.parse(fs.readFileSync(pendingFile));
+      pending.last_poll_at = '2000-01-01T00:00:00.000Z';
+      fs.writeFileSync(pendingFile, JSON.stringify(pending), { mode: 0o600 });
+      pollResult = 'authorized';
+      const success = await run(['hook', 'user-prompt'], { env, input: hookInput('UserPromptSubmit') });
+      assert.match(JSON.parse(success.stdout).hookSpecificOutput.additionalContext, /login completed[\s\S]*remember desktop login/i);
+      assert(!fs.existsSync(pendingFile));
+      assert.strictEqual(fs.statSync(tokenFile).mode & 0o777, 0o600);
+      assert.doesNotMatch(success.stdout + success.stderr, /secret-access|secret-refresh/);
+
+      fs.rmSync(tokenFile);
+      await run(['hook', 'session-start'], { env, input: hookInput('SessionStart') });
+      pollResult = 'access_denied';
+      const denied = JSON.parse(fs.readFileSync(pendingFile));
+      denied.last_poll_at = '2000-01-01T00:00:00.000Z';
+      fs.writeFileSync(pendingFile, JSON.stringify(denied), { mode: 0o600 });
+      const deniedOut = await run(['hook', 'stop'], { env, input: hookInput('Stop') });
+      assert.strictEqual(deniedOut.stdout, '');
+      assert(!fs.existsSync(pendingFile));
+      await run(['hook', 'session-start'], { env, input: hookInput('SessionStart') });
+      assert.strictEqual(starts, 3, 'next SessionStart must issue a fresh code after denial');
+      const expired = JSON.parse(fs.readFileSync(pendingFile));
+      expired.expires_at = '2000-01-01T00:00:00.000Z';
+      fs.writeFileSync(pendingFile, JSON.stringify(expired), { mode: 0o600 });
+      const expiredOut = await run(['hook', 'user-prompt'], { env, input: hookInput('UserPromptSubmit') });
+      assert.strictEqual(expiredOut.stdout, '');
+      assert(!fs.existsSync(pendingFile));
+      await run(['hook', 'session-start'], { env, input: hookInput('SessionStart') });
+      assert.strictEqual(starts, 4, 'expired state must be replaced on the next SessionStart');
+      await new Promise(resolve => server.close(resolve));
+      const offline = JSON.parse(fs.readFileSync(pendingFile));
+      offline.last_poll_at = '2000-01-01T00:00:00.000Z';
+      fs.writeFileSync(pendingFile, JSON.stringify(offline), { mode: 0o600 });
+      const networkError = await run(['hook', 'user-prompt'], { env, input: hookInput('UserPromptSubmit') });
+      assert.strictEqual(networkError.stdout + networkError.stderr, '', 'network errors must fail silently');
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   await test('AC-20-1 refresh sends only refresh_token to strict brain schema', async () => {
     resetTestState();
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-refresh-strict-'));
@@ -704,10 +795,12 @@ function send(res, status, body) {
   const { server, url } = await startBrain(brainSchemas);
   try {
     const login = await run(['login', '--brain', url, '--no-browser'], { env: hookEnv });
-    assert.match(login.stdout, /Logged in to Phovia/);
-    assert.match(login.stdout, /phovia_memory_untrusted/);
-    assert.match(login.stdout, /prefers terse summaries/);
-    assert.doesNotMatch(login.stdout, /access-1|refresh-1/);
+    await test('AC-23-4 logged-in hooks and CLI fallback retain their existing behavior', async () => {
+      assert.match(login.stdout, /Logged in to Phovia/);
+      assert.match(login.stdout, /phovia_memory_untrusted/);
+      assert.match(login.stdout, /prefers terse summaries/);
+      assert.doesNotMatch(login.stdout, /access-1|refresh-1/);
+    });
     assert.strictEqual(fs.statSync(tokenFile).mode & 0o777, 0o600);
     let auth = JSON.parse(fs.readFileSync(tokenFile, 'utf8'));
     assert.strictEqual(auth.access_token, 'access-1');
