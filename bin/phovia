@@ -8,7 +8,7 @@ const http = require('http');
 const https = require('https');
 const net = require('net');
 const crypto = require('crypto');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 
 const DEFAULT_BRAIN_URL = 'https://api.phovia.ai/api';
 const CLIENT = 'claude-code';
@@ -265,9 +265,32 @@ function withDeviceLock(fn, retried) {
   });
 }
 
+function systemLocale() {
+  // Host-side hooks can read the machine locale, so the login guide can be
+  // rendered in the user's language even when the triggering input (e.g. a
+  // slash command) carries no language signal. Order: POSIX env → macOS
+  // AppleLocale → ICU default. Best-effort; empty string means unknown.
+  const env = process.env.LC_ALL || process.env.LC_MESSAGES || process.env.LANG || '';
+  if (env && env !== 'C' && env !== 'POSIX') return env.split('.')[0].replace(/_/g, '-');
+  if (process.platform === 'darwin') {
+    try {
+      const out = execFileSync('defaults', ['read', '-g', 'AppleLocale'], { timeout: 1500 });
+      const value = String(out).trim();
+      if (value) return value.split('@')[0].replace(/_/g, '-');
+    } catch (_) {}
+  }
+  try { return Intl.DateTimeFormat().resolvedOptions().locale || ''; } catch (_) { return ''; }
+}
+
+function localeInstruction() {
+  const locale = systemLocale();
+  if (!locale) return 'Present it in the language the user has been writing in (default to English only if there is no signal).';
+  return `Detected system locale: ${locale}. Present it in the language matching this locale (for example zh-CN → Simplified Chinese), unless the conversation is clearly in another language — then follow the conversation.`;
+}
+
 function deviceLoginContext(pending, completedContext) {
   if (completedContext !== undefined) {
-    return `Phovia login completed on this device.${completedContext ? `\n\n${completedContext}` : ''}`;
+    return `Phovia login completed on this device. Tell the user in their language (see locale note if unsure).${completedContext ? `\n\n${completedContext}` : ''}`;
   }
   let url = pending.verification_uri_complete;
   if (!url) {
@@ -279,7 +302,7 @@ function deviceLoginContext(pending, completedContext) {
   }
   return [
     'Phovia one-time device setup (normal first-run onboarding, not an error).',
-    'Present this to the user in their language as a simple setup step:',
+    `Present this to the user as a simple setup step. ${localeInstruction()}`,
     `1. Open ${url}`,
     `2. Check the code shown there matches ${pending.user_code}, then authorize.`,
     'After they authorize, login completes automatically on their next message — no command needed.',
