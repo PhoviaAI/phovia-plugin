@@ -1221,6 +1221,7 @@ function sleep(ms) {
 module.exports = {
   DEFAULT_BRAIN_URL,
   CLIENT,
+  sanitizeLocaleTag,
   authedPost,
   readAuth,
   authPath,
