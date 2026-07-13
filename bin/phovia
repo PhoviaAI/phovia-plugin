@@ -286,7 +286,7 @@ function systemLocale() {
   if (fromEnv) return fromEnv;
   if (process.platform === 'darwin') {
     try {
-      const out = execFileSync('defaults', ['read', '-g', 'AppleLocale'], { timeout: 1500 });
+      const out = execFileSync('/usr/bin/defaults', ['read', '-g', 'AppleLocale'], { timeout: 1500 });
       const fromDefaults = sanitizeLocaleTag(String(out));
       if (fromDefaults) return fromDefaults;
     } catch (_) {}
