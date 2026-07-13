@@ -20,6 +20,7 @@ const DEFAULT_VERSION_TTL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_VERSION_TIMEOUT_MS = 2000;
 const SPOOL_MAX_ENTRIES = 200;
 const SPOOL_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const DEVICE_REQUEST_TIMEOUT_MS = 4000;
 
 if (require.main === module) {
   main().catch((err) => {
@@ -135,7 +136,7 @@ async function sessionStart(input) {
   const staleNoticePromise = checkStaleVersion();
   const result = await recallMemory(input, 'SessionStart');
   const staleNotice = await staleNoticePromise;
-  if (result.authNeeded) return showLoginMessage(staleNotice);
+  if (result.authNeeded) return deviceLoginStart('SessionStart', staleNotice);
   if (!result.ok) {
     if (staleNotice) hookJson({ suppressOutput: true, systemMessage: staleNotice });
     return;
@@ -151,6 +152,8 @@ async function sessionStart(input) {
 }
 
 async function userPrompt(input) {
+  const device = await deviceLoginPoll('UserPromptSubmit', input);
+  if (device.handled) return;
   if (!sessionLoadedPath(input) || hasSessionLoaded(input)) return;
   const result = await recallMemory(input, 'UserPromptSubmit');
   if (result.authNeeded || !result.ok) return;
@@ -189,6 +192,8 @@ async function recallMemory(input, event) {
 }
 
 async function stopHook(input) {
+  const device = await deviceLoginPoll('Stop', input);
+  if (device.handled) return;
   const auth = readAuth();
   const messages = buildIngestMessages(input);
   if (!messages.length) return;
@@ -202,6 +207,7 @@ async function stopHook(input) {
   };
   if (!auth || !auth.access_token || !auth.device_id) {
     spoolIngest(body, 'auth_missing');
+    if (device.authPending) return;
     return showLoginMessage();
   }
   const result = await authedPost('/insight/ingest', body);
@@ -212,6 +218,146 @@ async function stopHook(input) {
   if (shouldSpoolIngestFailure(result)) spoolIngest(body, result.authNeeded ? 'auth_needed' : 'sync_failed');
   else logIngestDrop(body, result);
   if (result.authNeeded) return showLoginMessage();
+}
+
+function pendingAuthPath() {
+  return path.join(stateDir(), 'pending-auth.json');
+}
+
+function readPendingAuth() {
+  const pending = readJsonFile(pendingAuthPath());
+  if (!pending || !pending.device_code || !pending.user_code) return null;
+  try { if (process.platform !== 'win32') fs.chmodSync(pendingAuthPath(), 0o600); } catch (_) {}
+  return pending;
+}
+
+function writePendingAuth(pending) {
+  writePrivateJson(pendingAuthPath(), pending);
+}
+
+function writePrivateJson(file, data) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(path.dirname(file), 0o700); } catch (_) {}
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+  try { fs.chmodSync(tmp, 0o600); } catch (_) {}
+  fs.renameSync(tmp, file);
+}
+
+function withDeviceLock(fn, retried) {
+  const file = `${pendingAuthPath()}.lock`;
+  let fd;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fd = fs.openSync(file, 'wx', 0o600);
+  } catch (_) {
+    try {
+      if (!retried && Date.now() - fs.statSync(file).mtimeMs > DEVICE_REQUEST_TIMEOUT_MS * 2) {
+        removeFile(file);
+        return withDeviceLock(fn, true);
+      }
+    } catch (_) {}
+    return Promise.resolve(null);
+  }
+  return Promise.resolve().then(fn).finally(() => {
+    try { fs.closeSync(fd); } catch (_) {}
+    removeFile(file);
+  });
+}
+
+function deviceLoginContext(pending, completedContext) {
+  if (completedContext !== undefined) {
+    return `Phovia login completed on this device.${completedContext ? `\n\n${completedContext}` : ''}`;
+  }
+  let url = pending.verification_uri_complete;
+  if (!url) {
+    try {
+      const target = new URL(pending.verification_uri || 'https://phovia.ai/device');
+      target.searchParams.set('user_code', pending.user_code);
+      url = target.toString();
+    } catch (_) { url = `https://phovia.ai/device?user_code=${encodeURIComponent(pending.user_code)}`; }
+  }
+  return `Phovia needs authorization. Open ${url} to complete login. User code: ${pending.user_code}`;
+}
+
+function emitHookContext(event, context, systemMessage) {
+  const out = { hookSpecificOutput: { hookEventName: event, additionalContext: context } };
+  if (systemMessage) out.systemMessage = systemMessage;
+  hookJson(out);
+}
+
+async function deviceLoginStart(event, systemMessage) {
+  try {
+    const existing = readPendingAuth();
+    if (existing && Date.parse(existing.expires_at) > Date.now()) {
+      return emitHookContext(event, deviceLoginContext(existing), systemMessage);
+    }
+    if (existing) removeFile(pendingAuthPath());
+    const pending = await withDeviceLock(async () => {
+      const shared = readPendingAuth();
+      if (shared && Date.parse(shared.expires_at) > Date.now()) return shared;
+      const brainUrl = normalizeBrainUrl(envBrainUrl() || DEFAULT_BRAIN_URL);
+      const deviceId = crypto.randomUUID();
+      const res = await jsonRequest('POST', authUrlFor(brainUrl, '/auth/device/start'), {
+        client: CLIENT, device_name: `${os.hostname()} (${os.platform()})`, device_id: deviceId
+      }, null, { timeoutMs: DEVICE_REQUEST_TIMEOUT_MS });
+      const data = res.json || {};
+      if (res.status < 200 || res.status >= 300 || !data.device_code || !data.user_code) return null;
+      const created = {
+        brain_url: brainUrl, device_id: deviceId, device_code: data.device_code, user_code: data.user_code,
+        verification_uri: data.verification_uri, verification_uri_complete: data.verification_uri_complete,
+        interval: Math.max(1, Number(data.interval || 5)),
+        expires_at: new Date(Date.now() + Math.max(1, Number(data.expires_in || 600)) * 1000).toISOString(),
+        last_poll_at: null
+      };
+      writePendingAuth(created);
+      return created;
+    });
+    if (pending) emitHookContext(event, deviceLoginContext(pending), systemMessage);
+  } catch (_) {}
+}
+
+async function deviceLoginPoll(event, input) {
+  if (readAuth() && readAuth().access_token) {
+    removeFile(pendingAuthPath());
+    return { handled: false };
+  }
+  const before = readPendingAuth();
+  if (!before) return { handled: false };
+  try {
+    const outcome = await withDeviceLock(async () => {
+      const pending = readPendingAuth();
+      if (!pending) return 'silent';
+      if (Date.parse(pending.expires_at) <= Date.now()) { removeFile(pendingAuthPath()); return 'silent'; }
+      const last = Date.parse(pending.last_poll_at || 0);
+      if (Number.isFinite(last) && Date.now() - last < pending.interval * 1000) return 'silent';
+      pending.last_poll_at = new Date().toISOString();
+      writePendingAuth(pending);
+      const res = await jsonRequest('POST', authUrlFor(pending.brain_url, '/auth/device/token'), {
+        device_code: pending.device_code, client: CLIENT
+      }, null, { timeoutMs: DEVICE_REQUEST_TIMEOUT_MS });
+      const error = String((res.json && res.json.error) || '').toLowerCase();
+      if (error === 'authorization_pending') return 'silent';
+      if (error === 'slow_down') { pending.interval += 5; writePendingAuth(pending); return 'silent'; }
+      if (['expired_token', 'expired', 'access_denied', 'denied', 'authorization_denied'].includes(error)) {
+        removeFile(pendingAuthPath()); return 'silent';
+      }
+      if (res.status < 200 || res.status >= 300) return 'silent';
+      saveTokens(pending.brain_url, pending.device_id, res.json || {});
+      removeFile(pendingAuthPath());
+      const auth = readAuth();
+      const recall = await insightPost(pending.brain_url, '/insight/recall', {
+        client: CLIENT, event, session_id: input && input.session_id, cwd: input && input.cwd,
+        source: input && input.source, model: input && input.model
+      }, bearer(auth.access_token), { timeoutMs: 2000 });
+      const context = recall.status >= 200 && recall.status < 300 ? formatRecall(recall.json || recall.text) : '';
+      return { context };
+    });
+    if (outcome && typeof outcome === 'object') emitHookContext(event, deviceLoginContext(null, outcome.context));
+    if (event === 'Stop') return { handled: false, authPending: !(outcome && typeof outcome === 'object') };
+  } catch (_) {}
+  if (event === 'Stop') return { handled: false, authPending: true };
+  return { handled: true };
 }
 
 async function authedPost(apiPath, body) {
@@ -256,9 +402,9 @@ function sameOrigin(a, b) {
   catch (_) { return false; }
 }
 
-async function insightPost(brainUrl, apiPath, body, headers) {
-  const res = await jsonRequest('POST', urlFor(brainUrl, apiPath), body, headers);
-  if (res.status === 404 && !hasApiBase(brainUrl)) return jsonRequest('POST', authUrlFor(brainUrl, apiPath), body, headers);
+async function insightPost(brainUrl, apiPath, body, headers, options) {
+  const res = await jsonRequest('POST', urlFor(brainUrl, apiPath), body, headers, options);
+  if (res.status === 404 && !hasApiBase(brainUrl)) return jsonRequest('POST', authUrlFor(brainUrl, apiPath), body, headers, options);
   return res;
 }
 
