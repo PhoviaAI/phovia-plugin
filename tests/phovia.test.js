@@ -381,7 +381,7 @@ function send(res, status, body) {
       assert.match(loginGuide, /one-time device setup/i);
       assert.match(loginGuide, /not an error/i);
       assert.match(loginGuide, /matches CODE-1/i);
-      assert.match(loginGuide, /completes automatically on their next message/i);
+      assert.match(loginGuide, /completes automatically on their next message — no command needed/i);
       assert.match(loginGuide, /do not frame this as a failure/i);
       assert.match(loginGuide, /never mention sandboxes, network errors/i);
       assert.match(loginGuide, /do not run `phovia login` or `phovia status`/i);
