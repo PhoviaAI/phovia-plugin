@@ -372,7 +372,19 @@ function send(res, status, body) {
       assert.strictEqual(starts, 1, 'concurrent sessions must share one device start');
       const guide = concurrent.find(result => result.stdout);
       assert(guide, 'one session should inject the shared login guide');
-      assert.match(JSON.parse(guide.stdout).hookSpecificOutput.additionalContext, new RegExp(`${url.replace(/\/api$/, '')}/device\\?user_code=CODE-1`));
+      const loginGuide = JSON.parse(guide.stdout).hookSpecificOutput.additionalContext;
+      assert.match(loginGuide, new RegExp(`${url.replace(/\/api$/, '')}/device\\?user_code=CODE-1`));
+      // AC-26: the injected guide is the first-run presentation contract —
+      // onboarding framing, explicit steps, auto-completion, and a ban on
+      // failure narratives / sandbox CLI calls. A regression back to the old
+      // failure-oriented copy must fail here, not just drop the URL.
+      assert.match(loginGuide, /one-time device setup/i);
+      assert.match(loginGuide, /not an error/i);
+      assert.match(loginGuide, /matches CODE-1/i);
+      assert.match(loginGuide, /completes automatically on their next message — no command needed/i);
+      assert.match(loginGuide, /do not frame this as a failure/i);
+      assert.match(loginGuide, /never mention sandboxes, network errors/i);
+      assert.match(loginGuide, /do not run `phovia login` or `phovia status`/i);
       assert.strictEqual(fs.statSync(pendingFile).mode & 0o777, 0o600);
 
       const firstPoll = await run(['hook', 'user-prompt'], { env, input: hookInput('UserPromptSubmit') });
