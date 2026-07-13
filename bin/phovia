@@ -207,6 +207,7 @@ async function stopHook(input) {
   };
   if (!auth || !auth.access_token || !auth.device_id) {
     spoolIngest(body, 'auth_missing');
+    if (device.authPending) return;
     return showLoginMessage();
   }
   const result = await authedPost('/insight/ingest', body);
@@ -268,7 +269,14 @@ function deviceLoginContext(pending, completedContext) {
   if (completedContext !== undefined) {
     return `Phovia login completed on this device.${completedContext ? `\n\n${completedContext}` : ''}`;
   }
-  const url = `https://phovia.ai/device?user_code=${encodeURIComponent(pending.user_code)}`;
+  let url = pending.verification_uri_complete;
+  if (!url) {
+    try {
+      const target = new URL(pending.verification_uri || 'https://phovia.ai/device');
+      target.searchParams.set('user_code', pending.user_code);
+      url = target.toString();
+    } catch (_) { url = `https://phovia.ai/device?user_code=${encodeURIComponent(pending.user_code)}`; }
+  }
   return `Phovia needs authorization. Open ${url} to complete login. User code: ${pending.user_code}`;
 }
 
@@ -297,7 +305,7 @@ async function deviceLoginStart(event, systemMessage) {
       if (res.status < 200 || res.status >= 300 || !data.device_code || !data.user_code) return null;
       const created = {
         brain_url: brainUrl, device_id: deviceId, device_code: data.device_code, user_code: data.user_code,
-        verification_uri_complete: data.verification_uri_complete,
+        verification_uri: data.verification_uri, verification_uri_complete: data.verification_uri_complete,
         interval: Math.max(1, Number(data.interval || 5)),
         expires_at: new Date(Date.now() + Math.max(1, Number(data.expires_in || 600)) * 1000).toISOString(),
         last_poll_at: null
@@ -346,8 +354,9 @@ async function deviceLoginPoll(event, input) {
       return { context };
     });
     if (outcome && typeof outcome === 'object') emitHookContext(event, deviceLoginContext(null, outcome.context));
-    if (event === 'Stop' && outcome && typeof outcome === 'object') return { handled: false };
+    if (event === 'Stop') return { handled: false, authPending: !(outcome && typeof outcome === 'object') };
   } catch (_) {}
+  if (event === 'Stop') return { handled: false, authPending: true };
   return { handled: true };
 }
 

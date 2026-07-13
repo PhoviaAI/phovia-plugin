@@ -335,6 +335,8 @@ function send(res, status, body) {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-hook-login-'));
     const tokenFile = path.join(tmp, 'auth.json');
     const pendingFile = path.join(tmp, 'pending-auth.json');
+    const transcript = path.join(tmp, 'transcript.jsonl');
+    fs.writeFileSync(transcript, '{"type":"user","message":{"role":"user","content":"save while pending"}}\n');
     let starts = 0;
     let polls = 0;
     let pollResult = 'authorization_pending';
@@ -343,7 +345,7 @@ function send(res, status, body) {
         starts += 1;
         setTimeout(() => send(res, 200, {
           device_code: `device-code-${starts}`, user_code: `CODE-${starts}`,
-          verification_uri: 'https://phovia.ai/device', interval: 10, expires_in: 600
+          verification_uri: `${url.replace(/\/api$/, '')}/device`, interval: 10, expires_in: 600
         }), 50);
         return;
       }
@@ -370,15 +372,20 @@ function send(res, status, body) {
       assert.strictEqual(starts, 1, 'concurrent sessions must share one device start');
       const guide = concurrent.find(result => result.stdout);
       assert(guide, 'one session should inject the shared login guide');
-      assert.match(JSON.parse(guide.stdout).hookSpecificOutput.additionalContext, /phovia\.ai\/device\?user_code=CODE-1/);
+      assert.match(JSON.parse(guide.stdout).hookSpecificOutput.additionalContext, new RegExp(`${url.replace(/\/api$/, '')}/device\\?user_code=CODE-1`));
       assert.strictEqual(fs.statSync(pendingFile).mode & 0o777, 0o600);
 
       const firstPoll = await run(['hook', 'user-prompt'], { env, input: hookInput('UserPromptSubmit') });
       assert.strictEqual(firstPoll.stdout, '');
       assert.strictEqual(polls, 1);
       assert(JSON.parse(fs.readFileSync(pendingFile)).last_poll_at);
-      await run(['hook', 'stop'], { env, input: hookInput('Stop') });
+      await run(['hook', 'stop'], { env, input: JSON.stringify({
+        hook_event_name: 'Stop', session_id: 'desktop-1', transcript_path: transcript,
+        last_assistant_message: 'pending answer'
+      }) });
       assert.strictEqual(polls, 1, 'rapid hooks must not exceed interval');
+      assert.strictEqual(fs.readdirSync(path.join(tmp, 'spool')).filter(name => name.endsWith('.json')).length, 1,
+        'Stop must spool the turn while login remains pending');
 
       const pending = JSON.parse(fs.readFileSync(pendingFile));
       pending.last_poll_at = '2000-01-01T00:00:00.000Z';
