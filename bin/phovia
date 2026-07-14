@@ -13,8 +13,6 @@ const { detectHost, reportError } = require('../lib/telemetry');
 
 const DEFAULT_BRAIN_URL = 'https://api.phovia.ai/api';
 const CLIENT = 'claude-code';
-const AGENT_ID = 'phovia-plugin';
-const DEFAULT_MODE = 'engineering';
 const MESSAGE_CONTENT_MAX = 8000;
 const DEFAULT_REPO = 'PhoviaAI/phovia-plugin';
 const DEFAULT_VERSION_TTL_MS = 6 * 60 * 60 * 1000;
@@ -47,6 +45,13 @@ async function main() {
 
 function help() {
   console.log(`Phovia Claude Code helper\n\nUsage:\n  phovia login [--brain URL] [--no-browser]\n  phovia status\n  phovia logout\n\nEnvironment:\n  PHOVIA_BRAIN_URL   Override the brain URL\n  PHOVIA_TOKEN_FILE  Override the token file (default: ~/.phovia/auth.json)`);
+}
+
+function detectChannel() {
+  const host = detectHost();
+  if (host === 'claude-code') return 'claude-code';
+  if (host === 'codex' || host.startsWith('codex-')) return 'codex';
+  return 'unknown';
 }
 
 function parseFlags(args) {
@@ -190,8 +195,7 @@ async function recallMemory(input, event) {
     event: event || 'SessionStart',
     session_id: input && input.session_id,
     cwd: input && input.cwd,
-    source: input && input.source,
-    model: input && input.model
+    source: input && input.source
   });
   if (result.authNeeded || !result.ok) return result;
   return Object.assign({}, result, { context: formatRecall(result.body) });
@@ -207,10 +211,11 @@ async function stopHook(input) {
     messages,
     device_id: auth && auth.device_id,
     agent_type: CLIENT,
-    agent_id: AGENT_ID,
+    channel: detectChannel(),
     session_id: input.session_id,
-    mode: DEFAULT_MODE
   };
+  const project = typeof input.cwd === 'string' ? path.basename(input.cwd) : '';
+  if (project) body.project = project;
   if (!auth || !auth.access_token || !auth.device_id) {
     spoolIngest(body, 'auth_missing');
     if (device.authPending) return;
@@ -671,8 +676,7 @@ async function flushSpoolLocked() {
     const body = Object.assign({}, entry.body);
     if (!body.device_id) body.device_id = auth.device_id;
     if (!body.agent_type) body.agent_type = CLIENT;
-    if (!body.agent_id) body.agent_id = AGENT_ID;
-    if (!body.mode) body.mode = DEFAULT_MODE;
+    if (!body.channel) body.channel = detectChannel();
     const result = await authedPost('/insight/ingest', body);
     if (!result.ok) {
       if (shouldSpoolIngestFailure(result)) {
