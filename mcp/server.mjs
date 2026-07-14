@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -7,8 +8,14 @@ import { ensureDependencies } from './deps.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(__dirname, '..');
-if (process.env.CLAUDE_PLUGIN_DATA) {
-  process.env.PHOVIA_TOKEN_PATH_FILE = path.join(process.env.CLAUDE_PLUGIN_DATA, 'token-path.json');
+const pluginDataDirs = [...new Set([
+  process.env.PHOVIA_MCP_DEPS_DIR,
+  process.env.CLAUDE_PLUGIN_DATA
+].filter(Boolean))];
+const pluginDataDir = pluginDataDirs.find(dir => fs.existsSync(path.join(dir, 'token-path.json')))
+  || pluginDataDirs[0];
+if (pluginDataDir) {
+  process.env.PHOVIA_TOKEN_PATH_FILE = path.join(pluginDataDir, 'token-path.json');
 }
 const pluginRequire = createRequire(import.meta.url);
 const phovia = pluginRequire(path.join(pluginRoot, 'bin', 'phovia'));
@@ -94,11 +101,33 @@ async function searchMemory(query, rawLimit) {
 }
 
 function logAuthDiagnostic(result) {
-  console.error(JSON.stringify({
+  const diagnostic = {
     event: 'mcp_search_auth_needed',
-    status: Number(result && result.status) || 0,
-    auth_source: phovia.authPathSource()
-  }));
+    status: Number(result && result.status) || (result && result.authNeeded ? 401 : 0),
+    auth_source: phovia.authPathSource(),
+    token_path_resolved: isAuthFileReadable()
+  };
+  console.error(JSON.stringify(diagnostic));
+  appendAuthDiagnostic(diagnostic);
+}
+
+function isAuthFileReadable() {
+  try {
+    fs.accessSync(phovia.authPath(), fs.constants.R_OK);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function appendAuthDiagnostic(diagnostic) {
+  if (!pluginDataDir) return;
+  try {
+    fs.mkdirSync(pluginDataDir, { recursive: true, mode: 0o700 });
+    const file = path.join(pluginDataDir, 'mcp-diagnostic.log');
+    fs.appendFileSync(file, JSON.stringify(diagnostic) + '\n', { mode: 0o600 });
+    if (process.platform !== 'win32') fs.chmodSync(file, 0o600);
+  } catch (_) {}
 }
 
 function clampLimit(value) {

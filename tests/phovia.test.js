@@ -518,6 +518,70 @@ function send(res, status, body) {
     }
   });
 
+  await test('AC-39-1 AC-39-2 AC-39-5 desktop MCP resolves the host token bridge from either plugin-data env and safely falls back', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-desktop-bridge-'));
+    const pluginData = path.join(tmp, 'plugin-data');
+    const pointer = path.join(pluginData, 'token-path.json');
+    fs.mkdirSync(pluginData, { recursive: true });
+    fs.writeFileSync(pointer, JSON.stringify({ token_file: path.join(tmp, 'missing-auth.json') }), { mode: 0o600 });
+    try {
+      for (const env of [
+        { PHOVIA_MCP_DEPS_DIR: pluginData, CLAUDE_PLUGIN_DATA: '' },
+        { PHOVIA_MCP_DEPS_DIR: '', CLAUDE_PLUGIN_DATA: pluginData },
+        { PHOVIA_MCP_DEPS_DIR: path.join(tmp, 'separate-deps-cache'), CLAUDE_PLUGIN_DATA: pluginData }
+      ]) {
+        await withMcp({ ...env, HOME: path.join(tmp, 'desktop-home') }, async ({ request, stderr }) => {
+          const called = await request('tools/call', { name: 'search_memory', arguments: { query: 'bridge source' } });
+          assert.match(called.content[0].text, /not authorized/);
+          await waitFor(() => stderr().includes('plugin_data_bridge'), 'expected plugin-data bridge auth source');
+        });
+      }
+
+      await withMcp({
+        PHOVIA_MCP_DEPS_DIR: '', CLAUDE_PLUGIN_DATA: '', HOME: path.join(tmp, 'empty-home')
+      }, async ({ request, stderr }) => {
+        const called = await request('tools/call', { name: 'search_memory', arguments: { query: 'safe fallback' } });
+        assert.match(called.content[0].text, /not authorized/);
+        await waitFor(() => /"auth_source":"home"/.test(stderr()), 'expected safe home fallback');
+      });
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await test('AC-39-3 manifest explicitly forwards CLAUDE_PLUGIN_DATA to the desktop MCP process', async () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '.claude-plugin', 'plugin.json'), 'utf8'));
+    assert.strictEqual(
+      manifest.mcpServers['phovia-memory'].env.CLAUDE_PLUGIN_DATA,
+      '${CLAUDE_PLUGIN_DATA}'
+    );
+  });
+
+  await test('AC-39-4 auth failures append a private, content-free plugin-data diagnostic', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-mcp-persistent-diagnostic-'));
+    const pluginData = path.join(tmp, 'plugin-data');
+    const tokenFile = path.join(tmp, 'missing-private-token.json');
+    fs.mkdirSync(pluginData, { recursive: true });
+    fs.writeFileSync(path.join(pluginData, 'token-path.json'), JSON.stringify({ token_file: tokenFile }), { mode: 0o600 });
+    try {
+      await withMcp({ PHOVIA_MCP_DEPS_DIR: pluginData, CLAUDE_PLUGIN_DATA: '' }, async ({ request }) => {
+        const called = await request('tools/call', {
+          name: 'search_memory', arguments: { query: 'private-memory-query-marker' }
+        });
+        assert.match(called.content[0].text, /not authorized/);
+        const logPath = path.join(pluginData, 'mcp-diagnostic.log');
+        await waitFor(() => fs.existsSync(logPath), 'expected persistent MCP diagnostic log');
+        const entries = fs.readFileSync(logPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+        assert(entries.some(entry => entry.auth_source === 'plugin_data_bridge' && entry.status === 401 && entry.token_path_resolved === false));
+        const raw = fs.readFileSync(logPath, 'utf8');
+        assert.doesNotMatch(raw, /private-memory-query-marker|missing-private-token|access_token|refresh_token|Bearer/i);
+        if (process.platform !== 'win32') assert.strictEqual(fs.statSync(logPath).mode & 0o777, 0o600);
+      });
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   await test('AC-23-1 AC-23-2 AC-23-3 AC-23-5 AC-23-6 AC-23-7 hook device state machine is silent, throttled, private, and idempotent', async () => {
     resetTestState();
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-hook-login-'));
@@ -1021,7 +1085,7 @@ function send(res, status, body) {
   const { server, url } = await startBrain(brainSchemas);
   try {
     const login = await run(['login', '--brain', url, '--no-browser'], { env: hookEnv });
-    await test('AC-23-4 logged-in hooks and CLI fallback retain their existing behavior', async () => {
+    await test('AC-23-4 AC-39-6 logged-in hooks and MCP search work while logged-out clients retain the login hint', async () => {
       assert.match(login.stdout, /Logged in to Phovia/);
       assert.match(login.stdout, /phovia_memory_untrusted/);
       assert.match(login.stdout, /prefers terse summaries/);
@@ -1240,7 +1304,7 @@ function send(res, status, body) {
     server.close();
     fs.rmSync(tmp, { recursive: true, force: true });
   }
-  await test('AC-31 hooks manifest launches each hook via inline command (Codex + Claude compat)', async () => {
+  await test('AC-31 AC-39-7 existing suite stays green and hook manifests launch via inline command', async () => {
     // Guards the real manifest launch path (not just bin/phovia): the 2026-07-14
     // bug was a command+args manifest Codex ignored, running a bare `node`.
     // Parse hooks.json and EXECUTE the declared command string as a host would.
