@@ -17,6 +17,7 @@ let tokenPolls = 0;
 let manifestVersion = '9.9.9';
 
 const phovia = require(path.join(__dirname, '..', 'bin', 'phovia'));
+const telemetry = require(path.join(__dirname, '..', 'lib', 'telemetry'));
 
 async function test(name, fn) {
   try {
@@ -330,6 +331,97 @@ function send(res, status, body) {
 }
 
 (async () => {
+  await test('AC-33-1 AC-33-4 AC-33-5 AC-33-6 AC-33-7 dependency-free telemetry scrubs private data and makes a valid envelope', async () => {
+    assert(telemetry.TIMEOUT_MS <= 2000);
+    assert.strictEqual(telemetry.detectHost({ CODEX_HOME: '/tmp' }), 'codex-desktop');
+    assert.strictEqual(telemetry.detectHost({ CLAUDE_CODE_ENTRYPOINT: 'cli' }), 'claude-code');
+    assert.strictEqual(telemetry.detectHost({}), 'unknown');
+    const secretError = new Error('Bearer top-secret access_token=abc refresh_token=def user_code=USER device_code=DEVICE eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature search query: private memory content');
+    const made = telemetry.createEnvelope(secretError, { event: 'hook:stop', host: 'claude-code', status: 401 }, 'http://public-key@example.test/42');
+    assert(made);
+    const lines = made.body.split('\n');
+    assert.strictEqual(lines.length, 3);
+    assert.strictEqual(JSON.parse(lines[1]).type, 'event');
+    const event = JSON.parse(lines[2]);
+    assert.strictEqual(JSON.parse(lines[1]).length, Buffer.byteLength(lines[2]));
+    assert.strictEqual(event.tags.event, 'hook:stop');
+    assert.strictEqual(event.tags.host, 'claude-code');
+    assert.strictEqual(event.tags.status, '401');
+    assert(event.exception.values[0].stacktrace.frames.every(frame => Object.keys(frame).every(key => ['filename', 'lineno', 'colno'].includes(key))));
+    assert(!/top-secret|access_token|refresh_token|\bUSER\b|\bDEVICE\b|eyJhbGci|private memory|search query/i.test(made.body));
+
+    await withProcessEnv({ PHOVIA_SENTRY_DSN: '', PHOVIA_SENTRY_DISABLED: '' }, async () => {
+      assert.strictEqual(await telemetry.reportError(new Error('noop'), { event: 'test' }), false);
+    });
+    await withProcessEnv({ PHOVIA_SENTRY_DSN: 'not a dsn', PHOVIA_SENTRY_DISABLED: '' }, async () => {
+      assert.strictEqual(await telemetry.reportError(new Error('noop'), { event: 'test' }), false);
+    });
+    await withProcessEnv({ PHOVIA_SENTRY_DSN: 'http://key@127.0.0.1:1/42', PHOVIA_SENTRY_DISABLED: '1' }, async () => {
+      assert.strictEqual(await telemetry.reportError(new Error('disabled'), { event: 'test' }), false);
+    });
+  });
+
+  await test('AC-33-2 AC-33-7 hook failure reports metadata and remains exit zero', async () => {
+    let captured;
+    const server = http.createServer((req, res) => {
+      let raw = '';
+      req.on('data', chunk => { raw += chunk; });
+      req.on('end', () => { captured = { path: req.url, raw }; res.writeHead(200); res.end(); });
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const dsn = `http://public@127.0.0.1:${server.address().port}/33`;
+      const result = await run(['hook', 'invalid-private-query'], {
+        env: { PHOVIA_SENTRY_DSN: dsn, CLAUDECODE: '1' }, input: '{}'
+      });
+      assert.strictEqual(result.status, 0);
+      assert.strictEqual(result.stdout, '');
+      assert(captured);
+      assert.strictEqual(captured.path, '/api/33/envelope/');
+      const event = JSON.parse(captured.raw.split('\n')[2]);
+      assert.strictEqual(event.tags.event, 'hook:invalid-private-query');
+      assert.strictEqual(event.tags.host, telemetry.detectHost(process.env));
+      assert.match(event.exception.values[0].value, /unknown hook event/);
+      assert(event.exception.values[0].stacktrace.frames.length > 0);
+    } finally { server.close(); }
+  });
+
+  await test('AC-33-7 AC-33-8 reporter network failure never affects plugin behavior and existing suite remains green', async () => {
+    await withProcessEnv({ PHOVIA_SENTRY_DSN: 'http://public@127.0.0.1:1/33', PHOVIA_SENTRY_DISABLED: '' }, async () => {
+      assert.strictEqual(await telemetry.reportError(new Error('network down'), { event: 'test' }), false);
+    });
+  });
+
+  await test('AC-33-3 MCP authNeeded reports 401 without query or token data', async () => {
+    const envelopes = [];
+    const sentry = http.createServer((req, res) => {
+      let raw = '';
+      req.on('data', chunk => { raw += chunk; });
+      req.on('end', () => { envelopes.push(raw); res.writeHead(200); res.end(); });
+    });
+    await new Promise(resolve => sentry.listen(0, '127.0.0.1', resolve));
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-mcp-telemetry-'));
+    try {
+      await withMcp({
+        PHOVIA_TOKEN_FILE: path.join(tmp, 'missing-auth.json'),
+        PHOVIA_SENTRY_DSN: `http://public@127.0.0.1:${sentry.address().port}/33`,
+        CODEX_HOME: tmp
+      }, async ({ request }) => {
+        const called = await request('tools/call', { name: 'search_memory', arguments: { query: 'private-query-marker' } });
+        assert.match(called.content[0].text, /not authorized/);
+        await waitFor(() => envelopes.length === 1, 'expected MCP telemetry envelope');
+      });
+      const event = JSON.parse(envelopes[0].split('\n')[2]);
+      assert.strictEqual(event.tags.event, 'mcp:search');
+      assert.strictEqual(event.tags.host, 'codex-desktop');
+      assert.strictEqual(event.tags.status, '401');
+      assert(!/private-query-marker|old-access|refresh/i.test(envelopes[0]));
+    } finally {
+      sentry.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   await test('AC-23-1 AC-23-2 AC-23-3 AC-23-5 AC-23-6 AC-23-7 hook device state machine is silent, throttled, private, and idempotent', async () => {
     resetTestState();
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-hook-login-'));

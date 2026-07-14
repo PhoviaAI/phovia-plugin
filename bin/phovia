@@ -9,6 +9,7 @@ const https = require('https');
 const net = require('net');
 const crypto = require('crypto');
 const { spawn, execFileSync } = require('child_process');
+const { detectHost, reportError } = require('../lib/telemetry');
 
 const DEFAULT_BRAIN_URL = 'https://api.phovia.ai/api';
 const CLIENT = 'claude-code';
@@ -23,8 +24,11 @@ const SPOOL_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const DEVICE_REQUEST_TIMEOUT_MS = 4000;
 
 if (require.main === module) {
-  main().catch((err) => {
-    if (process.argv[2] === 'hook') process.exit(0);
+  main().catch(async (err) => {
+    const cmd = process.argv[2];
+    const event = cmd === 'hook' ? `hook:${process.argv[3] || 'unknown'}` : (cmd === 'login' ? 'device-login' : `cli:${cmd || 'unknown'}`);
+    await reportError(err, { event, host: detectHost() });
+    if (cmd === 'hook') process.exit(0);
     console.error(`Phovia: ${err.message}`);
     process.exit(1);
   });
@@ -127,6 +131,7 @@ async function hook(kind) {
   if (kind === 'session-start') return sessionStart(input);
   if (kind === 'user-prompt') return userPrompt(input);
   if (kind === 'stop') return stopHook(input);
+  throw new Error(`unknown hook event: ${kind || 'missing'}`);
 }
 
 async function sessionStart(input) {
@@ -282,7 +287,8 @@ function systemLocale() {
   // rendered in the user's language even when the triggering input (e.g. a
   // slash command) carries no language signal. Order: POSIX env → macOS
   // AppleLocale → ICU default. Best-effort; empty string means unknown.
-  const fromEnv = sanitizeLocaleTag(process.env.LC_ALL || process.env.LC_MESSAGES || process.env.LANG || '');
+  const fromEnv = [process.env.LC_ALL, process.env.LC_MESSAGES, process.env.LANG]
+    .map(sanitizeLocaleTag).find(Boolean);
   if (fromEnv) return fromEnv;
   if (process.platform === 'darwin') {
     try {
@@ -344,7 +350,10 @@ async function deviceLoginStart(event, systemMessage) {
         client: CLIENT, device_name: `${os.hostname()} (${os.platform()})`, device_id: deviceId
       }, null, { timeoutMs: DEVICE_REQUEST_TIMEOUT_MS });
       const data = res.json || {};
-      if (res.status < 200 || res.status >= 300 || !data.device_code || !data.user_code) return null;
+      if (res.status < 200 || res.status >= 300 || !data.device_code || !data.user_code) {
+        await reportError(new Error('Device login start failed'), { event: `device-login:${event}`, host: detectHost(), status: res.status });
+        return null;
+      }
       const created = {
         brain_url: brainUrl, device_id: deviceId, device_code: data.device_code, user_code: data.user_code,
         verification_uri: data.verification_uri, verification_uri_complete: data.verification_uri_complete,
@@ -356,7 +365,9 @@ async function deviceLoginStart(event, systemMessage) {
       return created;
     });
     if (pending) emitHookContext(event, deviceLoginContext(pending), systemMessage);
-  } catch (_) {}
+  } catch (err) {
+    await reportError(err, { event: `device-login:${event}`, host: detectHost() });
+  }
 }
 
 async function deviceLoginPoll(event, input) {
@@ -382,9 +393,13 @@ async function deviceLoginPoll(event, input) {
       if (error === 'authorization_pending') return 'silent';
       if (error === 'slow_down') { pending.interval += 5; writePendingAuth(pending); return 'silent'; }
       if (['expired_token', 'expired', 'access_denied', 'denied', 'authorization_denied'].includes(error)) {
+        await reportError(new Error('Device login authorization denied'), { event: `device-login:${event}`, host: detectHost(), status: res.status });
         removeFile(pendingAuthPath()); return 'silent';
       }
-      if (res.status < 200 || res.status >= 300) return 'silent';
+      if (res.status < 200 || res.status >= 300) {
+        await reportError(new Error('Device login poll failed'), { event: `device-login:${event}`, host: detectHost(), status: res.status });
+        return 'silent';
+      }
       saveTokens(pending.brain_url, pending.device_id, res.json || {});
       removeFile(pendingAuthPath());
       const auth = readAuth();
@@ -397,7 +412,9 @@ async function deviceLoginPoll(event, input) {
     });
     if (outcome && typeof outcome === 'object') emitHookContext(event, deviceLoginContext(null, outcome.context));
     if (event === 'Stop') return { handled: false, authPending: !(outcome && typeof outcome === 'object') };
-  } catch (_) {}
+  } catch (err) {
+    await reportError(err, { event: `device-login:${event}`, host: detectHost() });
+  }
   if (event === 'Stop') return { handled: false, authPending: true };
   return { handled: true };
 }
