@@ -8,7 +8,12 @@ import { ensureDependencies } from './deps.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(__dirname, '..');
-const pluginDataDir = process.env.PHOVIA_MCP_DEPS_DIR || process.env.CLAUDE_PLUGIN_DATA;
+const pluginDataDirs = [...new Set([
+  process.env.PHOVIA_MCP_DEPS_DIR,
+  process.env.CLAUDE_PLUGIN_DATA
+].filter(Boolean))];
+const pluginDataDir = pluginDataDirs.find(dir => fs.existsSync(path.join(dir, 'token-path.json')))
+  || pluginDataDirs[0];
 if (pluginDataDir) {
   process.env.PHOVIA_TOKEN_PATH_FILE = path.join(pluginDataDir, 'token-path.json');
 }

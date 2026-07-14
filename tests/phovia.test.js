@@ -527,7 +527,8 @@ function send(res, status, body) {
     try {
       for (const env of [
         { PHOVIA_MCP_DEPS_DIR: pluginData, CLAUDE_PLUGIN_DATA: '' },
-        { PHOVIA_MCP_DEPS_DIR: '', CLAUDE_PLUGIN_DATA: pluginData }
+        { PHOVIA_MCP_DEPS_DIR: '', CLAUDE_PLUGIN_DATA: pluginData },
+        { PHOVIA_MCP_DEPS_DIR: path.join(tmp, 'separate-deps-cache'), CLAUDE_PLUGIN_DATA: pluginData }
       ]) {
         await withMcp({ ...env, HOME: path.join(tmp, 'desktop-home') }, async ({ request, stderr }) => {
           const called = await request('tools/call', { name: 'search_memory', arguments: { query: 'bridge source' } });
