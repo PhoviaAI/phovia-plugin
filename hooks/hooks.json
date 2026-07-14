@@ -5,10 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/mcp/install-deps.mjs"
-            ],
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/mcp/install-deps.mjs\"",
             "timeout": 120,
             "statusMessage": "Preparing Phovia MCP dependencies"
           }
@@ -18,12 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/bin/phovia",
-              "hook",
-              "session-start"
-            ],
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/phovia\" hook session-start",
             "timeout": 10,
             "statusMessage": "Recalling Phovia memory"
           }
@@ -35,12 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/bin/phovia",
-              "hook",
-              "user-prompt"
-            ],
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/phovia\" hook user-prompt",
             "timeout": 10
           }
         ]
@@ -51,12 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/bin/phovia",
-              "hook",
-              "stop"
-            ],
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/phovia\" hook stop",
             "timeout": 30,
             "statusMessage": "Syncing Phovia memory"
           }
