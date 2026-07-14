@@ -128,9 +128,9 @@ function makeVendoredBrainInsightSchemas(z) {
     messages: z.array(insightIngestMessageSchema).min(1).max(500),
     device_id: z.string().trim().min(1).max(200),
     agent_type: z.string().trim().min(1).max(50),
-    agent_id: z.string().trim().min(1).max(200),
+    channel: z.enum(['claude-code', 'codex', 'unknown']),
+    project: z.string().trim().min(1).max(200).optional(),
     session_id: z.string().trim().min(1).max(200),
-    mode: z.string().trim().min(1).max(50),
     generated_by_model: z.string().trim().min(1).max(100).optional()
   });
   return {
@@ -582,7 +582,7 @@ function send(res, status, body) {
     }
   });
 
-  await test('AC-23-1 AC-23-2 AC-23-3 AC-23-5 AC-23-6 AC-23-7 hook device state machine is silent, throttled, private, and idempotent', async () => {
+  await test('AC-23-1 AC-23-2 AC-23-3 AC-23-5 AC-23-6 AC-23-7 AC-37-4 hook device state machine is silent, throttled, private, and idempotent', async () => {
     resetTestState();
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-hook-login-'));
     const tokenFile = path.join(tmp, 'auth.json');
@@ -616,7 +616,7 @@ function send(res, status, body) {
       PHOVIA_DISABLE_VERSION_CHECK: '1', PHOVIA_SESSION_DIR: path.join(tmp, 'sessions'),
       LC_ALL: '', LC_MESSAGES: '', LANG: 'zh_CN.UTF-8'
     };
-    const hookInput = event => JSON.stringify({ hook_event_name: event, session_id: 'desktop-1', cwd: tmp });
+    const hookInput = event => JSON.stringify({ hook_event_name: event, session_id: 'desktop-1', cwd: tmp, model: 'private-client-model' });
     try {
       const concurrent = await Promise.all([
         run(['hook', 'session-start'], { env, input: hookInput('SessionStart') }),
@@ -676,6 +676,8 @@ function send(res, status, body) {
       pollResult = 'authorized';
       const success = await run(['hook', 'user-prompt'], { env, input: hookInput('UserPromptSubmit') });
       assert.match(JSON.parse(success.stdout).hookSpecificOutput.additionalContext, /login completed[\s\S]*remember desktop login/i);
+      const postLoginRecall = requests.filter(request => request.path === '/api/insight/recall').pop();
+      assert.strictEqual(postLoginRecall.body.model, undefined);
       assert(!fs.existsSync(pendingFile));
       assert.strictEqual(fs.statSync(tokenFile).mode & 0o777, 0o600);
       assert.doesNotMatch(success.stdout + success.stderr, /secret-access|secret-refresh/);
@@ -903,7 +905,7 @@ function send(res, status, body) {
         input: JSON.stringify({ hook_event_name: 'SessionStart', session_id: 'flush-s2', cwd: tmp })
       });
       await waitFor(
-        () => fs.readdirSync(spoolDir).filter(name => name.endsWith('.json')).length === 0,
+        () => ingests.length > 1 && fs.readdirSync(spoolDir).filter(name => name.endsWith('.json')).length === 0,
         'spool did not drain after successful hook'
       );
       assert.deepStrictEqual(ingests[1].messages, [
@@ -1098,7 +1100,7 @@ function send(res, status, body) {
 
     const start = await run(['hook', 'session-start'], {
       env: hookEnv,
-      input: JSON.stringify({ hook_event_name: 'SessionStart', session_id: 's1', cwd: tmp })
+      input: JSON.stringify({ hook_event_name: 'SessionStart', session_id: 's1', cwd: tmp, model: 'test-model' })
     });
     const startJson = JSON.parse(start.stdout);
     const ctx = startJson.hookSpecificOutput.additionalContext;
@@ -1215,20 +1217,53 @@ function send(res, status, body) {
 
     await run(['hook', 'stop'], {
       env: hookEnv,
+      unsetEnv: Object.keys(process.env).filter(key => key.startsWith('CODEX_')),
       input: JSON.stringify({ hook_event_name: 'Stop', session_id: 's1', cwd: tmp, transcript_path: transcript, last_assistant_message: 'done' })
     });
-    assertNoInsightContractViolations();
-    const ingest = requests.find(r => r.path === '/api/insight/ingest');
-    assert.deepStrictEqual(ingest.body.messages, [
-      { role: 'user', content: 'hello' },
-      { role: 'assistant', content: 'done' }
-    ]);
-    assert.strictEqual(ingest.body.agent_type, 'claude-code');
-    assert.strictEqual(ingest.body.agent_id, 'phovia-plugin');
-    assert.strictEqual(ingest.body.session_id, 's1');
-    assert.strictEqual(ingest.body.mode, 'engineering');
-    assert.ok(ingest.body.device_id, 'ingest must include device_id');
-    assert.strictEqual(ingest.body.transcript_tail, undefined);
+    await test('AC-37-1 AC-37-2 AC-37-3 AC-37-4 AC-37-5 AC-37-6 AC-37-7 AC-37-8 ingest sends canonical safe session context', async () => {
+      assertNoInsightContractViolations();
+      const ingest = requests.find(r => r.path === '/api/insight/ingest');
+      assert.deepStrictEqual(ingest.body.messages, [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'done' }
+      ]);
+      assert.strictEqual(ingest.body.agent_type, 'claude-code');
+      assert.strictEqual(ingest.body.channel, 'claude-code');
+      assert.strictEqual(ingest.body.host, undefined);
+      assert.strictEqual(ingest.body.project, path.basename(tmp));
+      assert.notStrictEqual(ingest.body.project, tmp);
+      assert.strictEqual(ingest.body.agent_id, undefined);
+      assert.strictEqual(ingest.body.mode, undefined);
+      assert.strictEqual(ingest.body.session_id, 's1');
+      assert.ok(ingest.body.device_id, 'ingest must include device_id');
+      assert.strictEqual(ingest.body.transcript_tail, undefined);
+      const recall = requests.find(r => r.path === '/api/insight/recall' && r.body.session_id === 's1');
+      assert.strictEqual(recall.body.model, undefined);
+
+      await run(['hook', 'stop'], {
+        env: { ...hookEnv, CODEX_HOME: '/tmp/codex' },
+        input: JSON.stringify({ hook_event_name: 'Stop', session_id: 'codex-no-cwd', transcript_path: transcript, last_assistant_message: 'done' })
+      });
+      const codexIngest = requests.find(r => r.path === '/api/insight/ingest' && r.body.session_id === 'codex-no-cwd');
+      assert.strictEqual(codexIngest.body.channel, 'codex');
+      assert.strictEqual(codexIngest.body.project, undefined);
+
+      await run(['hook', 'stop'], {
+        env: hookEnv,
+        unsetEnv: Object.keys(process.env).filter(key => key.startsWith('CODEX_') || key === 'CLAUDECODE' || key === 'CLAUDE_CODE_ENTRYPOINT'),
+        input: JSON.stringify({ hook_event_name: 'Stop', session_id: 'terminal', transcript_path: transcript, last_assistant_message: 'done' })
+      });
+      const terminalIngest = requests.find(r => r.path === '/api/insight/ingest' && r.body.session_id === 'terminal');
+      assert.strictEqual(terminalIngest.body.channel, 'unknown');
+
+      const longProject = 'p'.repeat(201);
+      await run(['hook', 'stop'], {
+        env: hookEnv,
+        input: JSON.stringify({ hook_event_name: 'Stop', session_id: 'long-project', cwd: path.join(tmp, longProject), transcript_path: transcript, last_assistant_message: 'done' })
+      });
+      const longProjectIngest = requests.find(r => r.path === '/api/insight/ingest' && r.body.session_id === 'long-project');
+      assert.strictEqual(longProjectIngest.body.project, longProject.slice(0, 200));
+    });
 
     // Regression: transcript tail ends with a NEW user message (the current
     // reply lives only in last_assistant_message). The reply must pair with the
