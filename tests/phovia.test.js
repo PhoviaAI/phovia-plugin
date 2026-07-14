@@ -582,7 +582,7 @@ function send(res, status, body) {
     }
   });
 
-  await test('AC-23-1 AC-23-2 AC-23-3 AC-23-5 AC-23-6 AC-23-7 hook device state machine is silent, throttled, private, and idempotent', async () => {
+  await test('AC-23-1 AC-23-2 AC-23-3 AC-23-5 AC-23-6 AC-23-7 AC-37-4 hook device state machine is silent, throttled, private, and idempotent', async () => {
     resetTestState();
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-hook-login-'));
     const tokenFile = path.join(tmp, 'auth.json');
@@ -616,7 +616,7 @@ function send(res, status, body) {
       PHOVIA_DISABLE_VERSION_CHECK: '1', PHOVIA_SESSION_DIR: path.join(tmp, 'sessions'),
       LC_ALL: '', LC_MESSAGES: '', LANG: 'zh_CN.UTF-8'
     };
-    const hookInput = event => JSON.stringify({ hook_event_name: event, session_id: 'desktop-1', cwd: tmp });
+    const hookInput = event => JSON.stringify({ hook_event_name: event, session_id: 'desktop-1', cwd: tmp, model: 'private-client-model' });
     try {
       const concurrent = await Promise.all([
         run(['hook', 'session-start'], { env, input: hookInput('SessionStart') }),
@@ -676,6 +676,8 @@ function send(res, status, body) {
       pollResult = 'authorized';
       const success = await run(['hook', 'user-prompt'], { env, input: hookInput('UserPromptSubmit') });
       assert.match(JSON.parse(success.stdout).hookSpecificOutput.additionalContext, /login completed[\s\S]*remember desktop login/i);
+      const postLoginRecall = requests.filter(request => request.path === '/api/insight/recall').pop();
+      assert.strictEqual(postLoginRecall.body.model, undefined);
       assert(!fs.existsSync(pendingFile));
       assert.strictEqual(fs.statSync(tokenFile).mode & 0o777, 0o600);
       assert.doesNotMatch(success.stdout + success.stderr, /secret-access|secret-refresh/);
@@ -1253,6 +1255,14 @@ function send(res, status, body) {
       });
       const terminalIngest = requests.find(r => r.path === '/api/insight/ingest' && r.body.session_id === 'terminal');
       assert.strictEqual(terminalIngest.body.channel, 'unknown');
+
+      const longProject = 'p'.repeat(201);
+      await run(['hook', 'stop'], {
+        env: hookEnv,
+        input: JSON.stringify({ hook_event_name: 'Stop', session_id: 'long-project', cwd: path.join(tmp, longProject), transcript_path: transcript, last_assistant_message: 'done' })
+      });
+      const longProjectIngest = requests.find(r => r.path === '/api/insight/ingest' && r.body.session_id === 'long-project');
+      assert.strictEqual(longProjectIngest.body.project, longProject.slice(0, 200));
     });
 
     // Regression: transcript tail ends with a NEW user message (the current
