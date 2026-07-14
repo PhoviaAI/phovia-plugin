@@ -1066,21 +1066,24 @@ function send(res, status, body) {
         assert.strictEqual(typeof cmd, 'string', event + ' command must be an inline string');
         assert(/^node "\$\{CLAUDE_PLUGIN_ROOT\}\//.test(cmd), event + ' command must invoke node on a plugin-root path: ' + cmd);
       }
-      const primary = commands[commands.length - 1];
-      const resolved = primary.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, pluginRoot);
-      const code = await new Promise(resolve => {
-        const child = spawn('/bin/sh', ['-c', resolved], {
-          env: Object.assign({}, process.env, {
-            PHOVIA_TOKEN_FILE: path.join(os.tmpdir(), 'phovia-manifest-' + event + '.json'),
-            PHOVIA_STATE_DIR: path.join(os.tmpdir(), 'phovia-manifest-state-' + event),
-            PHOVIA_DISABLE_VERSION_CHECK: '1'
-          })
+      // Execute EVERY declared command (SessionStart has install-deps first,
+      // recall second) — not just the last — so a regression in any one is caught.
+      for (let i = 0; i < commands.length; i += 1) {
+        const resolved = commands[i].replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, pluginRoot);
+        const code = await new Promise(resolve => {
+          const child = spawn('/bin/sh', ['-c', resolved], {
+            env: Object.assign({}, process.env, {
+              PHOVIA_TOKEN_FILE: path.join(os.tmpdir(), 'phovia-manifest-' + event + '-' + i + '.json'),
+              PHOVIA_STATE_DIR: path.join(os.tmpdir(), 'phovia-manifest-state-' + event + '-' + i),
+              PHOVIA_DISABLE_VERSION_CHECK: '1'
+            })
+          });
+          child.stdin.end(JSON.stringify({ hook_event_name: event, session_id: 'manifest-' + event + '-' + i, cwd: os.tmpdir() }));
+          child.on('close', c => resolve(c));
+          child.on('error', () => resolve(-1));
         });
-        child.stdin.end(JSON.stringify({ hook_event_name: event, session_id: 'manifest-' + event, cwd: os.tmpdir() }));
-        child.on('close', c => resolve(c));
-        child.on('error', () => resolve(-1));
-      });
-      assert.strictEqual(code, 0, event + ' inline command must exit 0 (fail-silent), got ' + code);
+        assert.strictEqual(code, 0, event + ' command #' + i + ' must exit 0 (fail-silent), got ' + code + ': ' + commands[i]);
+      }
     }
   });
 
