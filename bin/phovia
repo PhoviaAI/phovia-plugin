@@ -135,6 +135,7 @@ async function hook(kind) {
 }
 
 async function sessionStart(input) {
+  publishAuthPath();
   // Stale-version self-heal: surface a loud, actionable notice if the installed
   // plugin is behind the latest published version. Always fail safe — a version
   // check must never block the session for long or suppress memory recall.
@@ -559,7 +560,34 @@ function fixAuthMode() {
 }
 
 function authPath() {
-  return process.env.PHOVIA_TOKEN_FILE || path.join(os.homedir(), '.phovia', 'auth.json');
+  const bridged = readBridgedAuthPath();
+  return bridged || process.env.PHOVIA_TOKEN_FILE || path.join(os.homedir(), '.phovia', 'auth.json');
+}
+
+function authPathSource() {
+  if (readBridgedAuthPath()) return 'plugin_data_bridge';
+  if (process.env.PHOVIA_TOKEN_FILE) return 'environment';
+  return 'home';
+}
+
+function readBridgedAuthPath() {
+  const pointer = process.env.PHOVIA_TOKEN_PATH_FILE;
+  if (!pointer) return '';
+  const data = readJsonFile(pointer);
+  return data && typeof data.token_file === 'string' && path.isAbsolute(data.token_file)
+    ? data.token_file
+    : '';
+}
+
+function publishAuthPath() {
+  const pluginData = process.env.CLAUDE_PLUGIN_DATA;
+  if (!pluginData) return;
+  try {
+    const hostPath = process.env.PHOVIA_TOKEN_FILE || path.join(os.homedir(), '.phovia', 'auth.json');
+    writePrivateJson(path.join(path.resolve(pluginData), 'token-path.json'), {
+      token_file: path.resolve(hostPath)
+    });
+  } catch (_) {}
 }
 
 function stateDir() {
@@ -1241,6 +1269,7 @@ module.exports = {
   authedPost,
   readAuth,
   authPath,
+  authPathSource,
   sessionLoadedPath,
   hasSessionLoaded,
   markSessionLoaded,

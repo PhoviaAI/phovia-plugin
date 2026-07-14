@@ -7,6 +7,9 @@ import { ensureDependencies } from './deps.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(__dirname, '..');
+if (process.env.CLAUDE_PLUGIN_DATA) {
+  process.env.PHOVIA_TOKEN_PATH_FILE = path.join(process.env.CLAUDE_PLUGIN_DATA, 'token-path.json');
+}
 const pluginRequire = createRequire(import.meta.url);
 const phovia = pluginRequire(path.join(pluginRoot, 'bin', 'phovia'));
 const telemetry = pluginRequire(path.join(pluginRoot, 'lib', 'telemetry'));
@@ -74,9 +77,11 @@ async function searchMemory(query, rawLimit) {
   try {
     const result = await phovia.authedPost('/memory/search', { query, limit });
     if (result.authNeeded) {
+      logAuthDiagnostic(result);
       telemetry.reportError(new Error('MCP authorization required'), { event: 'mcp:search', host: telemetry.detectHost(), status: result.status || 401 });
       return loginHint();
     }
+    if (result.status === 401) logAuthDiagnostic(result);
     if (!result.ok) {
       telemetry.reportError(new Error('MCP request failed'), { event: 'mcp:search', host: telemetry.detectHost(), status: result.status });
       return searchError(result.body);
@@ -86,6 +91,14 @@ async function searchMemory(query, rawLimit) {
     telemetry.reportError(err, { event: 'mcp:search', host: telemetry.detectHost(), status: err && err.status });
     return `Phovia memory search is temporarily unavailable: ${err.message || String(err)}. You can continue without memory search, or run /phovia:phovia login to reconnect if needed.`;
   }
+}
+
+function logAuthDiagnostic(result) {
+  console.error(JSON.stringify({
+    event: 'mcp_search_auth_needed',
+    status: Number(result && result.status) || 0,
+    auth_source: phovia.authPathSource()
+  }));
 }
 
 function clampLimit(value) {
