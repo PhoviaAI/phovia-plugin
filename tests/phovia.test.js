@@ -402,6 +402,7 @@ function send(res, status, body) {
         const secretQuery = 'private diagnostic query';
         const called = await request('tools/call', { name: 'search_memory', arguments: { query: secretQuery } });
         assert.match(called.content[0].text, /not authorized/);
+        await waitFor(() => stderr().includes('mcp_search_auth_needed'), 'MCP auth diagnostic was not emitted');
         assert.match(stderr(), /mcp_search_auth_needed/);
         assert.doesNotMatch(stderr(), new RegExp(secretQuery));
         assert.doesNotMatch(stderr(), /access_token|refresh_token|Bearer/i);
