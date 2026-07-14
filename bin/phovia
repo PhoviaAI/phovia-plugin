@@ -287,8 +287,7 @@ function systemLocale() {
   // rendered in the user's language even when the triggering input (e.g. a
   // slash command) carries no language signal. Order: POSIX env → macOS
   // AppleLocale → ICU default. Best-effort; empty string means unknown.
-  const fromEnv = [process.env.LC_ALL, process.env.LC_MESSAGES, process.env.LANG]
-    .map(sanitizeLocaleTag).find(Boolean);
+  const fromEnv = sanitizeLocaleTag(process.env.LC_ALL || process.env.LC_MESSAGES || process.env.LANG || '');
   if (fromEnv) return fromEnv;
   if (process.platform === 'darwin') {
     try {
