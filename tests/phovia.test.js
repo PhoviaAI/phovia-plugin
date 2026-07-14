@@ -271,7 +271,7 @@ async function withMcp(env, fn) {
   });
   notify('notifications/initialized', {});
   try {
-    return await fn({ request });
+    return await fn({ request, stderr: () => stderr });
   } finally {
     child.kill();
   }
@@ -330,6 +330,88 @@ function send(res, status, body) {
 }
 
 (async () => {
+  await test('AC-34-1 MCP auth originally falls back to HOME while manifest has no token-file env', async () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '.claude-plugin', 'plugin.json'), 'utf8'));
+    assert.strictEqual(manifest.mcpServers['phovia-memory'].env.PHOVIA_TOKEN_FILE, undefined);
+    await withProcessEnv({ PHOVIA_TOKEN_FILE: '', PHOVIA_TOKEN_PATH_FILE: '', HOME: '/tmp/phovia-wrong-home' }, async () => {
+      assert.strictEqual(phovia.authPath(), path.join(os.homedir(), '.phovia', 'auth.json'));
+    });
+  });
+
+  await test('AC-34-2 AC-34-3 AC-34-4 AC-34-5 AC-34-7 SessionStart bridges host auth to MCP independently of HOME', async () => {
+    resetTestState();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-token-bridge-'));
+    const pluginData = path.join(tmp, 'plugin-data');
+    const tokenFile = path.join(tmp, 'host-home', '.phovia', 'auth.json');
+    const wrongHome = path.join(tmp, 'desktop-home');
+    const { server, url } = await startMiniBrain((req, res, body) => {
+      if (req.url === '/api/insight/recall') {
+        assert.strictEqual(req.headers.authorization, 'Bearer bridge-access');
+        return send(res, 200, { insights: ['bridge ready'] });
+      }
+      if (req.url === '/api/memory/search') {
+        assert.strictEqual(req.headers.authorization, 'Bearer bridge-access');
+        assert.strictEqual(body.query, 'bridged memory');
+        return send(res, 200, { facts: ['memory through host bridge'] });
+      }
+      return false;
+    });
+    try {
+      writeTestAuth(tokenFile, url, {
+        access_token: 'bridge-access',
+        expires_at: new Date(Date.now() + 3600000).toISOString()
+      });
+      await run(['hook', 'session-start'], {
+        env: {
+          CLAUDE_PLUGIN_DATA: pluginData,
+          PHOVIA_TOKEN_FILE: tokenFile,
+          PHOVIA_DISABLE_VERSION_CHECK: '1',
+          PHOVIA_SESSION_DIR: path.join(tmp, 'sessions')
+        },
+        input: JSON.stringify({ hook_event_name: 'SessionStart', session_id: 'bridge-host', cwd: tmp })
+      });
+      const pointer = path.join(pluginData, 'token-path.json');
+      assert.deepStrictEqual(JSON.parse(fs.readFileSync(pointer, 'utf8')), { token_file: path.resolve(tokenFile) });
+      if (process.platform !== 'win32') assert.strictEqual(fs.statSync(pointer).mode & 0o777, 0o600);
+
+      await withMcp({
+        CLAUDE_PLUGIN_DATA: pluginData,
+        PHOVIA_TOKEN_FILE: path.join(tmp, 'wrong-env-auth.json'),
+        HOME: wrongHome
+      }, async ({ request }) => {
+        const called = await request('tools/call', {
+          name: 'search_memory',
+          arguments: { query: 'bridged memory' }
+        });
+        assert.match(called.content[0].text, /memory through host bridge/);
+        assert.doesNotMatch(called.content[0].text, /not authorized|401/i);
+      });
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await test('AC-34-6 MCP auth failures emit safe diagnostic context', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-mcp-diagnostic-'));
+    try {
+      await withMcp({
+        CLAUDE_PLUGIN_DATA: path.join(tmp, 'plugin-data'),
+        PHOVIA_TOKEN_FILE: path.join(tmp, 'missing-auth.json')
+      }, async ({ request, stderr }) => {
+        const secretQuery = 'private diagnostic query';
+        const called = await request('tools/call', { name: 'search_memory', arguments: { query: secretQuery } });
+        assert.match(called.content[0].text, /not authorized/);
+        await waitFor(() => stderr().includes('mcp_search_auth_needed'), 'MCP auth diagnostic was not emitted');
+        assert.match(stderr(), /mcp_search_auth_needed/);
+        assert.doesNotMatch(stderr(), new RegExp(secretQuery));
+        assert.doesNotMatch(stderr(), /access_token|refresh_token|Bearer/i);
+      });
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   await test('AC-23-1 AC-23-2 AC-23-3 AC-23-5 AC-23-6 AC-23-7 hook device state machine is silent, throttled, private, and idempotent', async () => {
     resetTestState();
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phovia-hook-login-'));
