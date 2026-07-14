@@ -1052,6 +1052,41 @@ function send(res, status, body) {
     server.close();
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+  await test('AC-31 hooks manifest launches each hook via inline command (Codex + Claude compat)', async () => {
+    // Guards the real manifest launch path (not just bin/phovia): the 2026-07-14
+    // bug was a command+args manifest Codex ignored, running a bare `node`.
+    // Parse hooks.json and EXECUTE the declared command string as a host would.
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'hooks', 'hooks.json'), 'utf8'));
+    const pluginRoot = path.join(__dirname, '..');
+    for (const event of ['SessionStart', 'UserPromptSubmit', 'Stop']) {
+      const commands = (manifest.hooks[event] || [])
+        .flatMap(group => (group.hooks || []).map(h => h.command));
+      assert(commands.length, event + ' must declare at least one hook');
+      for (const cmd of commands) {
+        assert.strictEqual(typeof cmd, 'string', event + ' command must be an inline string');
+        assert(/^node "\$\{CLAUDE_PLUGIN_ROOT\}\//.test(cmd), event + ' command must invoke node on a plugin-root path: ' + cmd);
+      }
+      // Execute EVERY declared command (SessionStart has install-deps first,
+      // recall second) — not just the last — so a regression in any one is caught.
+      for (let i = 0; i < commands.length; i += 1) {
+        const resolved = commands[i].replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, pluginRoot);
+        const code = await new Promise(resolve => {
+          const child = spawn('/bin/sh', ['-c', resolved], {
+            env: Object.assign({}, process.env, {
+              PHOVIA_TOKEN_FILE: path.join(os.tmpdir(), 'phovia-manifest-' + event + '-' + i + '.json'),
+              PHOVIA_STATE_DIR: path.join(os.tmpdir(), 'phovia-manifest-state-' + event + '-' + i),
+              PHOVIA_DISABLE_VERSION_CHECK: '1'
+            })
+          });
+          child.stdin.end(JSON.stringify({ hook_event_name: event, session_id: 'manifest-' + event + '-' + i, cwd: os.tmpdir() }));
+          child.on('close', c => resolve(c));
+          child.on('error', () => resolve(-1));
+        });
+        assert.strictEqual(code, 0, event + ' command #' + i + ' must exit 0 (fail-silent), got ' + code + ': ' + commands[i]);
+      }
+    }
+  });
+
   console.log('phovia tests passed');
 })().catch(err => {
   console.error(err);
