@@ -338,7 +338,7 @@ function send(res, status, body) {
     assert.strictEqual(telemetry.detectHost({ CODEX_HOME: '/tmp' }), 'codex-desktop');
     assert.strictEqual(telemetry.detectHost({ CLAUDE_CODE_ENTRYPOINT: 'cli' }), 'claude-code');
     assert.strictEqual(telemetry.detectHost({}), 'unknown');
-    const secretError = new Error('Bearer top-secret "access_token":"abc" refresh_token=def "user_code": "USER" device_code=DEVICE access_token SPACESECRET eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature search query: private memory content');
+    const secretError = new Error('Bearer top-secret "access_token":"abc" refresh_token=def "user_code": "USER" device_code=DEVICE access_token SPACESECRET eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature open \'/Users/alice/.phovia/auth.json.123.tmp\'; search query: private memory content');
     const made = telemetry.createEnvelope(secretError, { event: 'hook:stop', host: 'claude-code', status: 401 }, 'http://public-key@example.test/42');
     assert(made);
     const lines = made.body.split('\n');
@@ -350,7 +350,7 @@ function send(res, status, body) {
     assert.strictEqual(event.tags.host, 'claude-code');
     assert.strictEqual(event.tags.status, '401');
     assert(event.exception.values[0].stacktrace.frames.every(frame => Object.keys(frame).every(key => ['filename', 'lineno', 'colno'].includes(key))));
-    assert(!/top-secret|SPACESECRET|access_token|refresh_token|\bUSER\b|\bDEVICE\b|eyJhbGci|private memory|search query/i.test(made.body));
+    assert(!/top-secret|SPACESECRET|access_token|refresh_token|\bUSER\b|\bDEVICE\b|eyJhbGci|Users\/alice|auth\.json|private memory|search query/i.test(made.body));
 
     await withProcessEnv({ PHOVIA_SENTRY_DSN: '', PHOVIA_SENTRY_DISABLED: '' }, async () => {
       assert.strictEqual(await telemetry.reportError(new Error('noop'), { event: 'test' }), false);
