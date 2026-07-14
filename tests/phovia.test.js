@@ -215,7 +215,14 @@ function run(args, opts = {}) {
 }
 
 async function withMcp(env, fn) {
-  const child = spawn(process.execPath, [mcpServer], { env: { ...process.env, ...env } });
+  const child = spawn(process.execPath, [mcpServer], {
+    env: {
+      ...process.env,
+      CLAUDE_PLUGIN_DATA: '',
+      PHOVIA_TOKEN_PATH_FILE: '',
+      ...env
+    }
+  });
   let nextId = 1;
   let stdout = '';
   let stderr = '';
@@ -444,7 +451,7 @@ function send(res, status, body) {
     const env = {
       PHOVIA_TOKEN_FILE: tokenFile, PHOVIA_STATE_DIR: tmp, PHOVIA_BRAIN_URL: url,
       PHOVIA_DISABLE_VERSION_CHECK: '1', PHOVIA_SESSION_DIR: path.join(tmp, 'sessions'),
-      LANG: 'zh_CN.UTF-8'
+      LC_ALL: '', LC_MESSAGES: '', LANG: 'zh_CN.UTF-8'
     };
     const hookInput = event => JSON.stringify({ hook_event_name: event, session_id: 'desktop-1', cwd: tmp });
     try {
