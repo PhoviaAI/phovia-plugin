@@ -200,7 +200,9 @@ function assertInsightSchemaGuardrails(schemas) {
 
 function run(args, opts = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [bin, ...args], { env: { ...process.env, ...opts.env } });
+    const env = { ...process.env, ...opts.env };
+    for (const key of opts.unsetEnv || []) delete env[key];
+    const child = spawn(process.execPath, [bin, ...args], { env });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', c => { stdout += c; });
@@ -336,7 +338,7 @@ function send(res, status, body) {
     assert.strictEqual(telemetry.detectHost({ CODEX_HOME: '/tmp' }), 'codex-desktop');
     assert.strictEqual(telemetry.detectHost({ CLAUDE_CODE_ENTRYPOINT: 'cli' }), 'claude-code');
     assert.strictEqual(telemetry.detectHost({}), 'unknown');
-    const secretError = new Error('Bearer top-secret access_token=abc refresh_token=def user_code=USER device_code=DEVICE eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature search query: private memory content');
+    const secretError = new Error('Bearer top-secret "access_token":"abc" refresh_token=def "user_code": "USER" device_code=DEVICE eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature search query: private memory content');
     const made = telemetry.createEnvelope(secretError, { event: 'hook:stop', host: 'claude-code', status: 401 }, 'http://public-key@example.test/42');
     assert(made);
     const lines = made.body.split('\n');
@@ -372,7 +374,9 @@ function send(res, status, body) {
     try {
       const dsn = `http://public@127.0.0.1:${server.address().port}/33`;
       const result = await run(['hook', 'invalid-private-query'], {
-        env: { PHOVIA_SENTRY_DSN: dsn, CLAUDECODE: '1' }, input: '{}'
+        env: { PHOVIA_SENTRY_DSN: dsn, CLAUDECODE: '1' },
+        unsetEnv: Object.keys(process.env).filter(key => key.startsWith('CODEX_')),
+        input: '{}'
       });
       assert.strictEqual(result.status, 0);
       assert.strictEqual(result.stdout, '');
@@ -380,7 +384,7 @@ function send(res, status, body) {
       assert.strictEqual(captured.path, '/api/33/envelope/');
       const event = JSON.parse(captured.raw.split('\n')[2]);
       assert.strictEqual(event.tags.event, 'hook:invalid-private-query');
-      assert.strictEqual(event.tags.host, telemetry.detectHost(process.env));
+      assert.strictEqual(event.tags.host, 'claude-code');
       assert.match(event.exception.values[0].value, /unknown hook event/);
       assert(event.exception.values[0].stacktrace.frames.length > 0);
     } finally { server.close(); }
